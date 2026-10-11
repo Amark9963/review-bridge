@@ -6,10 +6,11 @@ SAU integration patterns. Independent project; not affiliated with SAU or Yelp.
 ## Current slice
 
 Implemented: PostgreSQL migrations, partner API tokens, scoped account/location creation
-and reads, Yelp connections for locations with declared provider capabilities, Swagger,
+and reads, Yelp connections for locations with declared provider capabilities, on-demand
+review sync from a synthetic Yelp adapter, partner and account review feeds, Swagger,
 health checks, and PostgreSQL integration tests.
 
-Not implemented yet: Yelp API calls, reviews, sync jobs, worker, scheduling, account
+Not implemented yet: live Yelp API calls, sync jobs, worker, scheduling, account
 tokens, rate limiting, or webhooks. Build these one vertical slice at a time.
 
 ## Start (Docker Desktop with Linux containers)
@@ -52,7 +53,11 @@ In Swagger, choose **Authorize**, paste the raw `rb_...` token, then:
 7. `POST /v1/connections/{connection_id}/disable` with
    `{"reason":"incorrect_business"}` or `{"reason":"no_longer_needed"}`. Connections are
    never deleted and their business ID cannot change; to correct one, disable and reconnect.
-8. Create a second partner/token and try the first partner's IDs: expect `404`.
+8. Connect again, then `POST /v1/connections/{connection_id}/sync` to fetch the synthetic
+   reviews. Repeating within five minutes returns `429` (set `SYNC_COOLDOWN_SECONDS` to
+   change this). Read them with `GET /v1/partner/reviews` or
+   `GET /v1/accounts/{account_id}/reviews`; disabled connections' reviews are hidden.
+9. Create a second partner/token and try the first partner's IDs: expect `404`.
 
 List endpoints return arrays with `page` (default 1) and `limit` (default 25, maximum 100).
 These are current onboarding contracts; the future review feed will have pagination metadata.
