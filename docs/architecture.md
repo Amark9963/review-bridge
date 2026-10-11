@@ -60,10 +60,35 @@ Agreed for later slices:
 - Deactivating a location or account disables its connections explicitly, not by cascade.
 - Compliance removal of review content is a separate operator CLI action.
 
+## Reviews and feed
+
+Approved by the user on 2026-10-11 and implemented in the third slice.
+
+- Partners trigger a sync with `POST /v1/connections/{id}/sync`. This differs from SAU,
+  which has no on-demand collection endpoint. Until inbound rate limits exist, a cooldown
+  per connection (`SYNC_COOLDOWN_SECONDS`, default 300) protects provider quota: the slot
+  is claimed atomically before the provider call, a repeat within the cooldown gets 429
+  `sync_cooldown` with `Retry-After`, and a provider outage gives the slot back.
+- Order: claim the slot, end the transaction, fetch outside any transaction, normalize, then
+  lock the connection row, re-check it is active, and write. Disabling updates the same row,
+  so a disable during the fetch means nothing is written (409 `connection_disabled`).
+- The adapter returns raw Yelp-shaped reviews so normalization is exercised against the live
+  response shape. Bad entries are rejected individually and counted; repeated IDs keep the
+  first. Text is capped at 160 characters (`excerpt_max_chars`). Only the reviewer's display
+  name is stored, never profile or photo URLs.
+- Yelp's reference does not state the timezone of `time_created`; UTC is assumed in one
+  place (`app/reviews.py`) and must be verified against live data.
+- Writes compare a content hash: new reviews are inserted, changed ones update content and
+  `content_updated_at`, unchanged ones only advance `last_seen_at`. Missing reviews are kept.
+- Feeds follow SAU's scoping: `GET /v1/partner/reviews` (whole partner) and
+  `GET /v1/accounts/{id}/reviews` (one account, which account tokens will use later). Both
+  show only active connections, newest first, with `meta` (page, limit, total, last_page).
+
 ## Next slices
 
 1. ~~Location review-site connections and capabilities (Yelp only).~~ Done; see Connections.
-2. Synthetic Yelp adapter response -> normalization -> conditional upsert -> review feed.
+2. ~~Synthetic Yelp adapter response -> normalization -> conditional upsert -> review
+   feed.~~ Done; see Reviews and feed.
 3. Durable PostgreSQL jobs, worker leases/recovery, attempt history, retries and health.
 4. Feed filters, updated_since, page validation, eventual-consistency contract.
 5. Authorized live Yelp evaluation with content expiry and no unsupported completeness claims.

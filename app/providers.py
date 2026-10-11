@@ -9,6 +9,7 @@ CAPABILITIES = {
         "provider": "yelp",
         "reviews": "sample",
         "max_reviews_per_fetch": 3,
+        "excerpt_max_chars": 160,
         "full_history": False,
         "deletion_detection": False,
         "reply_posting": False,

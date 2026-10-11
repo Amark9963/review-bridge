@@ -47,6 +47,45 @@ class ConnectionOut(BaseModel):
     verified_at: datetime
     disabled_at: datetime | None
     disabled_reason: DisableReason | None
+    last_synced_at: datetime | None
+
+
+class SyncResultOut(BaseModel):
+    connection_id: UUID
+    synced_at: datetime
+    fetched: int
+    inserted: int
+    updated: int
+    unchanged: int
+    rejected: int
+
+
+class ReviewOut(BaseModel):
+    id: UUID
+    connection_id: UUID
+    location_id: UUID
+    account_id: UUID
+    provider: Provider
+    external_review_id: str
+    rating: int
+    text: str
+    author_name: str
+    review_url: str
+    reviewed_at: datetime
+    created_at: datetime
+    content_updated_at: datetime
+
+
+class PageMeta(BaseModel):
+    page: int
+    limit: int
+    total: int
+    last_page: int
+
+
+class ReviewPageOut(BaseModel):
+    data: list[ReviewOut]
+    meta: PageMeta
 
 
 class BusinessOut(BaseModel):
@@ -72,6 +111,7 @@ class ReviewSiteOut(BaseModel):
     provider: Provider
     reviews: Literal["sample"]
     max_reviews_per_fetch: int
+    excerpt_max_chars: int
     full_history: bool
     deletion_detection: bool
     reply_posting: bool

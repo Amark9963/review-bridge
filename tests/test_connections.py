@@ -63,6 +63,7 @@ def test_review_site_capabilities(client, tenants):
     assert response.status_code == 200
     assert response.json() == [{
         "provider": "yelp", "reviews": "sample", "max_reviews_per_fetch": 3,
+        "excerpt_max_chars": 160,
         "full_history": False, "deletion_detection": False, "reply_posting": False,
         "content_max_age_hours": 24,
     }]

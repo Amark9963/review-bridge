@@ -24,7 +24,9 @@ from app.schemas import (
     DisableConnection,
     LocationOut,
     PartnerOut,
+    ReviewPageOut,
     ReviewSiteOut,
+    SyncResultOut,
 )
 from app.yelp import YelpClient, yelp_client
 
@@ -48,6 +50,7 @@ def current_scope(
 
 
 Auth = Annotated[Scope, Depends(current_scope)]
+Yelp = Annotated[YelpClient, Depends(yelp_client)]
 
 
 @app.middleware("http")
@@ -135,7 +138,7 @@ def list_review_sites(scope: Auth):
 @app.post("/v1/locations/{location_id}/connections", response_model=CreatedConnectionOut,
           status_code=201, tags=["connections"])
 def create_connection(location_id: UUID, body: CreateConnection, session: DB, scope: Auth,
-                      yelp: Annotated[YelpClient, Depends(yelp_client)]):
+                      yelp: Yelp):
     result, business = services.create_connection(session, scope, yelp, location_id,
                                                   body.provider, body.external_business_id)
     return {**ConnectionOut.model_validate(result).model_dump(), "business": asdict(business)}
@@ -157,3 +160,20 @@ def get_connection(connection_id: UUID, session: DB, scope: Auth):
           tags=["connections"])
 def disable_connection(connection_id: UUID, body: DisableConnection, session: DB, scope: Auth):
     return services.disable_connection(session, scope, connection_id, body.reason)
+
+
+@app.post("/v1/connections/{connection_id}/sync", response_model=SyncResultOut,
+          tags=["reviews"])
+def sync_connection(connection_id: UUID, session: DB, scope: Auth, yelp: Yelp):
+    return services.sync_connection(session, scope, yelp, connection_id)
+
+
+@app.get("/v1/partner/reviews", response_model=ReviewPageOut, tags=["reviews"])
+def partner_reviews(session: DB, scope: Auth, limit: Limit = 25, page: Page = 1):
+    return services.review_feed(session, scope, limit, page)
+
+
+@app.get("/v1/accounts/{account_id}/reviews", response_model=ReviewPageOut, tags=["reviews"])
+def account_reviews(account_id: UUID, session: DB, scope: Auth, limit: Limit = 25,
+                    page: Page = 1):
+    return services.review_feed(session, scope, limit, page, account_id)
