@@ -1,0 +1,68 @@
+name: reviewbridge
+x-app: &app
+  build: .
+  environment:
+    DATABASE_URL: postgresql+psycopg://reviewbridge:${POSTGRES_PASSWORD:-reviewbridge_local}@db:5432/reviewbridge
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: reviewbridge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-reviewbridge_local}
+      POSTGRES_DB: reviewbridge
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reviewbridge -d reviewbridge"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  test-db:
+    image: postgres:17-alpine
+    profiles: ["test"]
+    environment:
+      POSTGRES_USER: reviewbridge
+      POSTGRES_PASSWORD: test_only
+      POSTGRES_DB: reviewbridge_test
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reviewbridge -d reviewbridge_test"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  test:
+    <<: *app
+    profiles: ["test"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://reviewbridge:test_only@test-db:5432/reviewbridge_test
+    command: ["sh", "-c", "alembic upgrade head && alembic check && pytest -q && ruff check --no-cache ."]
+    depends_on:
+      test-db:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
