@@ -108,7 +108,40 @@ def test_pagination_and_unknown_resources(client, tenants):
     assert client.get(f"/v1/accounts/{uuid4()}", headers=headers(a)).status_code == 404
 
 
+def test_location_validation_pagination_and_unknown(client, tenants):
+    a = tenants[0]
+    account_id = client.post(f"/v1/partners/{a[0].id}/accounts", headers=headers(a),
+                             json={"name": "Brightwell Dental"}).json()["id"]
+    path = f"/v1/accounts/{account_id}/locations"
+    for body in [{"name": "   "}, {"name": "x", "account_id": "override"}]:
+        response = client.post(path, headers=headers(a), json=body)
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "validation_error"
+    for name in ["First", "Second", "Third"]:
+        assert client.post(path, headers=headers(a), json={"name": name}).status_code == 201
+    first = client.get(f"{path}?limit=2&page=1", headers=headers(a)).json()
+    second = client.get(f"{path}?limit=2&page=2", headers=headers(a)).json()
+    assert len(first) == 2 and len(second) == 1
+    assert len({row["id"] for row in first + second}) == 3
+    for query in ["limit=250", "limit=0", "page=0"]:
+        assert client.get(f"{path}?{query}", headers=headers(a)).status_code == 422
+    response = client.get(f"/v1/locations/{uuid4()}", headers=headers(a))
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_found"
+
+
+def test_get_partner(client, tenants):
+    a, b = tenants
+    for partner, _, secret in [a, b]:
+        response = client.get("/v1/partner", headers={"Authorization": f"Bearer {secret}"})
+        assert response.status_code == 200
+        body = response.json()
+        assert body["id"] == str(partner.id)
+        assert body["name"] == partner.name
+
+
 def test_health_and_openapi(client):
+    assert client.get("/health/live").json() == {"status": "ok"}
     assert client.get("/health/ready").status_code == 200
     schema = client.get("/openapi.json").json()
     assert schema["components"]["securitySchemes"]["HTTPBearer"]["scheme"] == "bearer"
