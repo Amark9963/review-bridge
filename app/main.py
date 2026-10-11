@@ -1,3 +1,4 @@
+from dataclasses import asdict
 from typing import Annotated
 from uuid import UUID, uuid4
 
@@ -13,7 +14,19 @@ from app import services
 from app.auth import Scope, authenticate
 from app.db import get_session
 from app.errors import ServiceError
-from app.schemas import AccountOut, CreateNamed, LocationOut, PartnerOut
+from app.providers import CAPABILITIES
+from app.schemas import (
+    AccountOut,
+    ConnectionOut,
+    CreateConnection,
+    CreatedConnectionOut,
+    CreateNamed,
+    DisableConnection,
+    LocationOut,
+    PartnerOut,
+    ReviewSiteOut,
+)
+from app.yelp import YelpClient, yelp_client
 
 app = FastAPI(title="ReviewBridge", version="0.1.0", description=(
     "Slice 1: partner-scoped onboarding. Provision a token through the operator CLI, "
@@ -49,7 +62,7 @@ async def request_id(request: Request, call_next):
 async def service_error(request: Request, exc: ServiceError):
     return JSONResponse(status_code=exc.status, content={"error": {
         "code": exc.code, "message": exc.message, "request_id": request.state.request_id,
-    }}, headers={"WWW-Authenticate": "Bearer"} if exc.status == 401 else None)
+    }}, headers={"WWW-Authenticate": "Bearer"} if exc.status == 401 else exc.headers)
 
 
 @app.exception_handler(RequestValidationError)
@@ -112,3 +125,35 @@ def list_locations(account_id: UUID, session: DB, scope: Auth, limit: Limit = 25
 @app.get("/v1/locations/{location_id}", response_model=LocationOut, tags=["locations"])
 def get_location(location_id: UUID, session: DB, scope: Auth):
     return services.location(session, scope, location_id)
+
+
+@app.get("/v1/review-sites", response_model=list[ReviewSiteOut], tags=["connections"])
+def list_review_sites(scope: Auth):
+    return list(CAPABILITIES.values())
+
+
+@app.post("/v1/locations/{location_id}/connections", response_model=CreatedConnectionOut,
+          status_code=201, tags=["connections"])
+def create_connection(location_id: UUID, body: CreateConnection, session: DB, scope: Auth,
+                      yelp: Annotated[YelpClient, Depends(yelp_client)]):
+    result, business = services.create_connection(session, scope, yelp, location_id,
+                                                  body.provider, body.external_business_id)
+    return {**ConnectionOut.model_validate(result).model_dump(), "business": asdict(business)}
+
+
+@app.get("/v1/locations/{location_id}/connections", response_model=list[ConnectionOut],
+         tags=["connections"])
+def list_connections(location_id: UUID, session: DB, scope: Auth, limit: Limit = 25,
+                     page: Page = 1, include_disabled: bool = False):
+    return services.connections(session, scope, location_id, include_disabled, limit, page)
+
+
+@app.get("/v1/connections/{connection_id}", response_model=ConnectionOut, tags=["connections"])
+def get_connection(connection_id: UUID, session: DB, scope: Auth):
+    return services.connection(session, scope, connection_id)
+
+
+@app.post("/v1/connections/{connection_id}/disable", response_model=ConnectionOut,
+          tags=["connections"])
+def disable_connection(connection_id: UUID, body: DisableConnection, session: DB, scope: Auth):
+    return services.disable_connection(session, scope, connection_id, body.reason)

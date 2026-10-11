@@ -17,9 +17,52 @@ Kafka, Kubernetes, or microservices in V1.
 - This first slice supports partner tokens only. Account scope is a later migration.
 - Development and test databases are separate; integration tests exercise PostgreSQL.
 
+## Connections
+
+Approved by the user on 2026-10-11 and implemented in the second slice.
+
+- A connection links one location to one external business on one provider (Yelp only).
+- Yelp business IDs only (22 URL-safe characters); aliases and URLs are rejected.
+- Verification happens during the create request, not in a background job, so every stored
+  connection is verified. Order: authorize the location and check conflicts (so failing
+  requests spend no provider quota), end the database transaction, look the ID up with a
+  short timeout, then insert. Unknown IDs return 422 `business_not_found`; provider
+  timeouts, errors and rate limits return 503 `provider_unavailable` with `Retry-After`.
+  Nothing is stored on failure. The trade-off: connecting is unavailable while Yelp is.
+- The Yelp adapter has a synthetic implementation (invented businesses, no network) selected
+  by `YELP_MODE`; the live implementation arrives with authorized access (slice 5).
+- Yelp's name, address and URL are returned once in the create response for the partner to
+  confirm the business, and never stored, until Yelp's caching terms are resolved.
+- One active connection per provider per location, and within a partner one active location
+  per business. Uniqueness is not enforced across partners, which would leak tenant data.
+  Both rules are partial unique indexes; conflicts return 409.
+- Connections are disabled, never deleted, and the business ID cannot be changed. Correcting
+  it means disabling the connection and creating another.
+- Disabling requires a reason: `incorrect_business` (its reviews were never valid) or
+  `no_longer_needed` (correct reviews, collection stops). Repeating a disable keeps the
+  original reason. Accidental disables are permanent; reconnect instead.
+- Provider capabilities are declared in code and served at `GET /v1/review-sites`, so
+  partners see Yelp's limits (three-excerpt sample, no history, 24-hour content age) upfront.
+- If shared listings are needed later, dropping the business index allows them, but sync
+  must then share fetches between connections to the same business.
+
+Agreed for later slices:
+
+- Reviews stay with the connection that fetched them and never move to a new connection.
+  The feed shows only active connections' reviews; disabled ones expire with live content.
+- The feed must announce removals with the disable reason, so partners who already copied
+  reviews (especially `incorrect_business` ones) can delete them. It should include
+  `provider` and `external_review_id` so partners can recognise reviews after a reconnect.
+- Sync failures, closures and Yelp listing merges are a sync status (for example
+  `needs_attention`), never an automatic disable. A merge never changes the stored ID.
+- Disabling cancels scheduled syncs, and a running sync re-checks the connection is still
+  active before writing.
+- Deactivating a location or account disables its connections explicitly, not by cascade.
+- Compliance removal of review content is a separate operator CLI action.
+
 ## Next slices
 
-1. Location review-site connections and capabilities (Yelp only).
+1. ~~Location review-site connections and capabilities (Yelp only).~~ Done; see Connections.
 2. Synthetic Yelp adapter response -> normalization -> conditional upsert -> review feed.
 3. Durable PostgreSQL jobs, worker leases/recovery, attempt history, retries and health.
 4. Feed filters, updated_since, page validation, eventual-consistency contract.

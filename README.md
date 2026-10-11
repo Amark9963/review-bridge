@@ -6,9 +6,10 @@ SAU integration patterns. Independent project; not affiliated with SAU or Yelp.
 ## Current slice
 
 Implemented: PostgreSQL migrations, partner API tokens, scoped account/location creation
-and reads, Swagger, health checks, and PostgreSQL integration tests.
+and reads, Yelp connections for locations with declared provider capabilities, Swagger,
+health checks, and PostgreSQL integration tests.
 
-Not implemented yet: Yelp connections, reviews, sync jobs, worker, scheduling, account
+Not implemented yet: Yelp API calls, reviews, sync jobs, worker, scheduling, account
 tokens, rate limiting, or webhooks. Build these one vertical slice at a time.
 
 ## Start (Docker Desktop with Linux containers)
@@ -42,7 +43,16 @@ In Swagger, choose **Authorize**, paste the raw `rb_...` token, then:
 2. `POST /v1/partners/{partner_id}/accounts` with `{"name":"Brightwell Dental"}`.
 3. `POST /v1/accounts/{account_id}/locations` with `{"name":"Georgetown"}`.
 4. Read the account and its locations.
-5. Create a second partner/token and try the first partner's IDs: expect `404`.
+5. `GET /v1/review-sites` to see what Yelp can and cannot provide.
+6. `POST /v1/locations/{location_id}/connections` with
+   `{"provider":"yelp","external_business_id":"rbtest0000000000000001"}`.
+   The ID is verified before it is stored, and the response shows the matched business
+   once for confirmation. Nothing contacts Yelp yet: the synthetic adapter treats IDs
+   starting `rbtest` as existing, `rbdown` as an outage (503), and anything else as unknown.
+7. `POST /v1/connections/{connection_id}/disable` with
+   `{"reason":"incorrect_business"}` or `{"reason":"no_longer_needed"}`. Connections are
+   never deleted and their business ID cannot change; to correct one, disable and reconnect.
+8. Create a second partner/token and try the first partner's IDs: expect `404`.
 
 List endpoints return arrays with `page` (default 1) and `limit` (default 25, maximum 100).
 These are current onboarding contracts; the future review feed will have pagination metadata.
