@@ -39,6 +39,21 @@ services:
       timeout: 5s
       retries: 5
 
+  worker:
+    <<: *app
+    command: ["python", "-m", "app.worker"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    # Time to finish the current job after SIGTERM before being killed.
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.worker", "--check"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
   test-db:
     image: postgres:17-alpine
     profiles: ["test"]

@@ -78,6 +78,8 @@ class ReviewSiteConnection(Identity, Base):
         Index("uq_connections_active_business", "partner_id", "provider",
               "external_business_id", unique=True, postgresql_where=ACTIVE),
         UniqueConstraint("partner_id", "id", name="uq_connections_partner_id_id"),
+        CheckConstraint("sync_status IN ('pending', 'ok', 'failing', 'needs_attention')",
+                        name="ck_connections_sync_status"),
     )
     partner_id: Mapped[UUID]
     location_id: Mapped[UUID] = mapped_column(index=True)
@@ -86,9 +88,11 @@ class ReviewSiteConnection(Identity, Base):
     verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     disabled_reason: Mapped[str | None] = mapped_column(String(32))
-    # Claimed atomically before each provider call, enforcing the sync cooldown.
-    sync_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Sync health, kept separate from disabling: failures never disable a connection.
+    sync_status: Mapped[str] = mapped_column(String(32), default="pending",
+                                             server_default="pending")
+    last_sync_error: Mapped[str | None] = mapped_column(String(64))
 
 
 class Review(Identity, Base):
@@ -118,6 +122,71 @@ class Review(Identity, Base):
     content_hash: Mapped[str] = mapped_column(String(64))
     # Advances only when content changes; unchanged observations update last_seen_at.
     content_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+UNFINISHED = text("status IN ('queued', 'running')")
+
+
+class SyncJob(Identity, Base):
+    """A requested sync, run at least once by a worker. Effects are idempotent, and at most
+    one job per connection is unfinished at a time."""
+
+    __tablename__ = "sync_jobs"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["partner_id", "connection_id"],
+            ["review_site_connections.partner_id", "review_site_connections.id"],
+            name="fk_sync_jobs_connection_tenant",
+        ),
+        CheckConstraint(
+            "status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')",
+            name="ck_sync_jobs_status"),
+        Index("uq_sync_jobs_unfinished", "connection_id", unique=True,
+              postgresql_where=UNFINISHED),
+        Index("ix_sync_jobs_due", "run_after", postgresql_where=text("status = 'queued'")),
+        Index("ix_sync_jobs_connection_created", "connection_id", "created_at"),
+    )
+    partner_id: Mapped[UUID]
+    connection_id: Mapped[UUID]
+    status: Mapped[str] = mapped_column(String(16))
+    attempts: Mapped[int]
+    max_attempts: Mapped[int]
+    run_after: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # The lease is a time-limited claim; an expired lease returns the job to the queue.
+    lease_owner: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    fetched: Mapped[int | None]
+    inserted: Mapped[int | None]
+    updated: Mapped[int | None]
+    unchanged: Mapped[int | None]
+    rejected: Mapped[int | None]
+
+
+class SyncAttempt(Identity, Base):
+    __tablename__ = "sync_attempts"
+    __table_args__ = (
+        UniqueConstraint("job_id", "number", name="uq_sync_attempts_job_number"),
+        CheckConstraint(
+            "outcome IN ('running', 'succeeded', 'retrying', 'failed', 'cancelled', "
+            "'lease_expired')", name="ck_sync_attempts_outcome"),
+    )
+    job_id: Mapped[UUID] = mapped_column(ForeignKey("sync_jobs.id"))
+    number: Mapped[int]
+    worker_id: Mapped[str] = mapped_column(String(128))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    outcome: Mapped[str] = mapped_column(String(16))
+    error_code: Mapped[str | None] = mapped_column(String(64))
+
+
+class WorkerHeartbeat(Base):
+    __tablename__ = "worker_heartbeats"
+    worker_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 

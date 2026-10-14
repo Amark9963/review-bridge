@@ -48,16 +48,43 @@ class ConnectionOut(BaseModel):
     disabled_at: datetime | None
     disabled_reason: DisableReason | None
     last_synced_at: datetime | None
+    sync_status: Literal["pending", "ok", "failing", "needs_attention"]
+    last_sync_error: str | None
 
 
-class SyncResultOut(BaseModel):
+class SyncJobOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: UUID
+    created_at: datetime
     connection_id: UUID
-    synced_at: datetime
-    fetched: int
-    inserted: int
-    updated: int
-    unchanged: int
-    rejected: int
+    status: Literal["queued", "running", "succeeded", "failed", "cancelled"]
+    attempts: int
+    max_attempts: int
+    run_after: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+    error_code: str | None
+    fetched: int | None
+    inserted: int | None
+    updated: int | None
+    unchanged: int | None
+    rejected: int | None
+
+
+class SyncAttemptOut(BaseModel):
+    """Worker identities are operational detail and are not shown to partners."""
+
+    model_config = ConfigDict(from_attributes=True)
+    number: int
+    started_at: datetime
+    finished_at: datetime | None
+    outcome: Literal["running", "succeeded", "retrying", "failed", "cancelled",
+                     "lease_expired"]
+    error_code: str | None
+
+
+class SyncJobDetailOut(SyncJobOut):
+    attempt_history: list[SyncAttemptOut]
 
 
 class ReviewOut(BaseModel):
