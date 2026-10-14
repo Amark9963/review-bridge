@@ -10,7 +10,9 @@ and reads, Yelp connections for locations with declared provider capabilities, o
 review sync from a synthetic Yelp adapter, partner and account review feeds, Swagger,
 health checks, and PostgreSQL integration tests.
 
-Not implemented yet: live Yelp API calls, sync jobs, worker, scheduling, account
+Sync jobs run in a separate worker with retries, lease recovery and attempt history.
+
+Not implemented yet: live Yelp API calls, scheduled syncing, account
 tokens, rate limiting, or webhooks. Build these one vertical slice at a time.
 
 ## Start (Docker Desktop with Linux containers)
@@ -53,10 +55,14 @@ In Swagger, choose **Authorize**, paste the raw `rb_...` token, then:
 7. `POST /v1/connections/{connection_id}/disable` with
    `{"reason":"incorrect_business"}` or `{"reason":"no_longer_needed"}`. Connections are
    never deleted and their business ID cannot change; to correct one, disable and reconnect.
-8. Connect again, then `POST /v1/connections/{connection_id}/sync` to fetch the synthetic
-   reviews. Repeating within five minutes returns `429` (set `SYNC_COOLDOWN_SECONDS` to
-   change this). Read them with `GET /v1/partner/reviews` or
-   `GET /v1/accounts/{account_id}/reviews`; disabled connections' reviews are hidden.
+8. Connect again. Its first sync is queued automatically and the `worker` service fetches
+   the synthetic reviews within seconds; watch it with
+   `GET /v1/connections/{connection_id}/sync-jobs` and `GET /v1/sync-jobs/{job_id}`.
+   `POST /v1/connections/{connection_id}/sync` queues another (`202`); requesting again
+   while one is unfinished returns the same job, and within five minutes of the last job
+   returns `429` (set `SYNC_COOLDOWN_SECONDS` to change this). Read reviews with
+   `GET /v1/partner/reviews` or `GET /v1/accounts/{account_id}/reviews`; disabled
+   connections' reviews are hidden.
 9. Create a second partner/token and try the first partner's IDs: expect `404`.
 
 List endpoints return arrays with `page` (default 1) and `limit` (default 25, maximum 100).
@@ -85,7 +91,8 @@ and run Ruff. They refuse the development database and do not contact Yelp.
 ## Operate locally
 
 ```powershell
-docker compose logs api migrate
+docker compose logs api migrate worker
+docker compose exec api python -m app.cli job-stats
 docker compose stop
 docker compose up -d
 ```

@@ -64,14 +64,9 @@ Agreed for later slices:
 
 Approved by the user on 2026-10-11 and implemented in the third slice.
 
-- Partners trigger a sync with `POST /v1/connections/{id}/sync`. This differs from SAU,
-  which has no on-demand collection endpoint. Until inbound rate limits exist, a cooldown
-  per connection (`SYNC_COOLDOWN_SECONDS`, default 300) protects provider quota: the slot
-  is claimed atomically before the provider call, a repeat within the cooldown gets 429
-  `sync_cooldown` with `Retry-After`, and a provider outage gives the slot back.
-- Order: claim the slot, end the transaction, fetch outside any transaction, normalize, then
-  lock the connection row, re-check it is active, and write. Disabling updates the same row,
-  so a disable during the fetch means nothing is written (409 `connection_disabled`).
+- Partners can request a sync with `POST /v1/connections/{id}/sync`. This differs from SAU,
+  which has no on-demand collection endpoint. Since the fourth slice it queues a job (see
+  Sync jobs and worker) rather than calling the provider during the request.
 - The adapter returns raw Yelp-shaped reviews so normalization is exercised against the live
   response shape. Bad entries are rejected individually and counted; repeated IDs keep the
   first. Text is capped at 160 characters (`excerpt_max_chars`). Only the reviewer's display
@@ -84,12 +79,49 @@ Approved by the user on 2026-10-11 and implemented in the third slice.
   `GET /v1/accounts/{id}/reviews` (one account, which account tokens will use later). Both
   show only active connections, newest first, with `meta` (page, limit, total, last_page).
 
+## Sync jobs and worker
+
+Approved by the user on 2026-10-11 and implemented in the fourth slice. This moves
+collection into the background, as SAU's public behaviour implies (queued first collection,
+scheduled collection, no on-demand endpoint); SAU's internals are not public.
+
+- Jobs live in PostgreSQL (`sync_jobs`) with one row per attempt (`sync_attempts`). A
+  partial unique index allows one queued or running job per connection.
+- `POST /v1/connections/{id}/sync` returns 202 with the queued job; while one is unfinished
+  it returns that job, so repeats are harmless. A cooldown since the last job was created
+  (`SYNC_COOLDOWN_SECONDS`, default 300) still applies; repeats get 429 `sync_cooldown`.
+- Creating a connection queues its first sync in the same transaction.
+- Disabling cancels queued jobs. A running job re-checks the connection, under its row
+  lock, before writing, and is cancelled instead if it was disabled.
+- The worker (`python -m app.worker`, Compose service `worker`) claims the oldest due job
+  with `FOR UPDATE SKIP LOCKED` under a 60-second lease, fetches outside any transaction,
+  then writes only if it still holds the lease. Several workers can run; one is deployed.
+- Expired leases (a crashed or killed worker) return the job to the queue with the attempt
+  recorded as `lease_expired`. Jobs are at least once; review writes are idempotent.
+- Retryable errors (provider unavailable, unexpected errors) back off 30 s, 2 min, 8 min and
+  30 min (each +/-20%) for up to 5 attempts, then fail. `business_not_found` fails at once.
+- Connections carry `sync_status`: `pending`, `ok`, `failing` (retrying or retries
+  exhausted) or `needs_attention` (permanent error), plus `last_sync_error`. Failures never
+  disable a connection.
+- Partners see jobs and attempt history at `GET /v1/sync-jobs/{id}` and
+  `GET /v1/connections/{id}/sync-jobs`; worker identities are not shown.
+- Health: workers record heartbeats; the Compose health check (`--check`) requires a recent
+  one. The operator command `job-stats` reports queue depth, the oldest due job's age, and
+  24-hour outcomes. The worker finishes its current job on SIGTERM.
+- Workers poll every 2 seconds when idle; PostgreSQL LISTEN/NOTIFY can replace this later.
+- Disabling cancels queued jobs with one conditional `UPDATE ... WHERE status = 'queued'`,
+  so a job a worker claims at the same moment is left running and cancels itself.
+- The lease is not renewed during the provider call. The synthetic adapter returns at once;
+  before live Yelp (slice 5), keep the provider timeout well under the 60-second lease or
+  renew it, otherwise a slow call can be recovered and fetched twice (writes stay safe).
+
 ## Next slices
 
 1. ~~Location review-site connections and capabilities (Yelp only).~~ Done; see Connections.
 2. ~~Synthetic Yelp adapter response -> normalization -> conditional upsert -> review
    feed.~~ Done; see Reviews and feed.
-3. Durable PostgreSQL jobs, worker leases/recovery, attempt history, retries and health.
+3. ~~Durable PostgreSQL jobs, worker leases/recovery, attempt history, retries and
+   health.~~ Done; see Sync jobs and worker.
 4. Feed filters, updated_since, page validation, eventual-consistency contract.
 5. Authorized live Yelp evaluation with content expiry and no unsupported completeness claims.
 6. Scheduling, inbound rate limits, account tokens and operational logging.

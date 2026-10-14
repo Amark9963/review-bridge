@@ -1,14 +1,15 @@
 """Operator-only provisioning: never exposed as an unauthenticated API route."""
 import argparse
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.auth import issue_token
 from app.db import engine
-from app.models import ApiToken, Partner
+from app.models import ApiToken, Partner, SyncJob, WorkerHeartbeat
 from app.schemas import CreateNamed
 
 
@@ -22,8 +23,12 @@ def main():
     issue.add_argument("--label", default="operator-issued")
     revoke = commands.add_parser("revoke-token")
     revoke.add_argument("--token-id", required=True, type=UUID)
+    commands.add_parser("job-stats")
     args = parser.parse_args()
     with Session(engine()) as session:
+        if args.command == "job-stats":
+            print(json.dumps(job_stats(session), indent=2))
+            return
         if args.command == "revoke-token":
             token = session.get(ApiToken, args.token_id)
             if token is None:
@@ -47,6 +52,28 @@ def main():
                   "token": secret, "expires_at": token.expires_at.isoformat()}
         session.commit()
         print(json.dumps(result, indent=2))
+
+
+def job_stats(session: Session) -> dict:
+    """A growing oldest_due_seconds is the first sign that workers are stuck or missing."""
+    now = datetime.now(UTC)
+    day_ago = now - timedelta(days=1)
+    due = SyncJob.status == "queued", SyncJob.run_after <= now
+    oldest = session.scalar(select(func.min(SyncJob.run_after)).where(*due))
+
+    def count(*conditions):
+        return session.scalar(select(func.count()).select_from(SyncJob).where(*conditions))
+
+    return {
+        "queued_due": count(*due),
+        "queued_later": count(SyncJob.status == "queued", SyncJob.run_after > now),
+        "oldest_due_seconds": int((now - oldest).total_seconds()) if oldest else 0,
+        "running": count(SyncJob.status == "running"),
+        "succeeded_24h": count(SyncJob.status == "succeeded", SyncJob.finished_at >= day_ago),
+        "failed_24h": count(SyncJob.status == "failed", SyncJob.finished_at >= day_ago),
+        "workers_alive": session.scalar(select(func.count()).select_from(WorkerHeartbeat)
+            .where(WorkerHeartbeat.last_seen_at >= now - timedelta(seconds=30))),
+    }
 
 
 if __name__ == "__main__":

@@ -26,13 +26,14 @@ from app.schemas import (
     PartnerOut,
     ReviewPageOut,
     ReviewSiteOut,
-    SyncResultOut,
+    SyncJobDetailOut,
+    SyncJobOut,
 )
 from app.yelp import YelpClient, yelp_client
 
 app = FastAPI(title="ReviewBridge", version="0.1.0", description=(
-    "Slice 1: partner-scoped onboarding. Provision a token through the operator CLI, "
-    "then paste the token into Authorize. Yelp ingestion is not implemented yet."
+    "Partner-scoped review integration. Provision a token through the operator CLI, then "
+    "paste the token into Authorize. Yelp is synthetic: no live Yelp calls are made yet."
 ))
 bearer = HTTPBearer(auto_error=False)
 DB = Annotated[Session, Depends(get_session)]
@@ -162,10 +163,22 @@ def disable_connection(connection_id: UUID, body: DisableConnection, session: DB
     return services.disable_connection(session, scope, connection_id, body.reason)
 
 
-@app.post("/v1/connections/{connection_id}/sync", response_model=SyncResultOut,
-          tags=["reviews"])
-def sync_connection(connection_id: UUID, session: DB, scope: Auth, yelp: Yelp):
-    return services.sync_connection(session, scope, yelp, connection_id)
+@app.post("/v1/connections/{connection_id}/sync", response_model=SyncJobOut,
+          status_code=202, tags=["sync"])
+def request_sync(connection_id: UUID, session: DB, scope: Auth):
+    return services.request_sync(session, scope, connection_id)
+
+
+@app.get("/v1/connections/{connection_id}/sync-jobs", response_model=list[SyncJobOut],
+         tags=["sync"])
+def list_sync_jobs(connection_id: UUID, session: DB, scope: Auth, limit: Limit = 25,
+                   page: Page = 1):
+    return services.sync_jobs(session, scope, connection_id, limit, page)
+
+
+@app.get("/v1/sync-jobs/{job_id}", response_model=SyncJobDetailOut, tags=["sync"])
+def get_sync_job(job_id: UUID, session: DB, scope: Auth):
+    return services.sync_job(session, scope, job_id)
 
 
 @app.get("/v1/partner/reviews", response_model=ReviewPageOut, tags=["reviews"])

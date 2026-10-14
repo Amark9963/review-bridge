@@ -6,10 +6,13 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from test_connections import connect, headers, new_location
 
+from app import jobs
 from app.config import settings
 from app.main import app
 from app.models import Review, ReviewSiteConnection
-from app.yelp import BusinessNotFound, ProviderUnavailable, SyntheticYelp, yelp_client
+from app.yelp import SyntheticYelp, yelp_client
+
+WORKER = "test-worker"
 
 
 def raw(n, rating=5, text="Great visit.", name="Jane D.", created="2026-03-01 10:00:00"):
@@ -22,17 +25,14 @@ def raw(n, rating=5, text="Great visit.", name="Jane D.", created="2026-03-01 10
 class FakeYelp(SyntheticYelp):
     def __init__(self):
         self.raw = None
-        self.down = False
-        self.missing = False
+        self.error = None
         self.during_fetch = None
 
     def reviews(self, business_id):
         if self.during_fetch:
             self.during_fetch()
-        if self.down:
-            raise ProviderUnavailable()
-        if self.missing:
-            raise BusinessNotFound()
+        if self.error:
+            raise self.error
         if self.raw is None:
             return super().reviews(business_id)
         return copy.deepcopy(self.raw)
@@ -50,13 +50,31 @@ def no_cooldown(monkeypatch):
     monkeypatch.setattr(settings(), "sync_cooldown_seconds", 0)
 
 
+def work(session, yelp, now=None):
+    """Runs every due job, as the worker would, and returns the attempt outcomes."""
+    now = now or jobs.utcnow()
+    outcomes = []
+    while (job := jobs.claim(session, WORKER, now)) is not None:
+        outcomes.append(jobs.run(session, yelp, job, WORKER, clock=lambda: now))
+    return outcomes
+
+
 def connected(client, tenant, n=1):
-    location_id = new_location(client, tenant)
-    return connect(client, tenant, location_id, n=n).json()
+    """Connects a new location; its first sync is queued but not yet run."""
+    return connect(client, tenant, new_location(client, tenant), n=n).json()
 
 
 def sync(client, tenant, connection_id):
     return client.post(f"/v1/connections/{connection_id}/sync", headers=headers(tenant))
+
+
+def latest_job(client, tenant, connection_id):
+    return client.get(f"/v1/connections/{connection_id}/sync-jobs",
+                      headers=headers(tenant)).json()[0]
+
+
+def counts(job):
+    return {key: job[key] for key in ["fetched", "inserted", "updated", "unchanged", "rejected"]}
 
 
 def feed(client, tenant, path="/v1/partner/reviews"):
@@ -71,10 +89,8 @@ def stored(session, external_review_id):
 def test_sync_inserts_then_leaves_unchanged_reviews_alone(client, session, tenants, yelp):
     a = tenants[0]
     connection = connected(client, a)
-    first = sync(client, a, connection["id"])
-    assert first.status_code == 200
-    assert {key: first.json()[key] for key in
-            ["fetched", "inserted", "updated", "unchanged", "rejected"]} == {
+    assert work(session, yelp) == ["succeeded"]
+    assert counts(latest_job(client, a, connection["id"])) == {
         "fetched": 3, "inserted": 3, "updated": 0, "unchanged": 0, "rejected": 0}
     body = feed(client, a)
     assert body["meta"] == {"page": 1, "limit": 25, "total": 3, "last_page": 1}
@@ -87,40 +103,46 @@ def test_sync_inserts_then_leaves_unchanged_reviews_alone(client, session, tenan
     before = stored(session, newest["external_review_id"])
     content_updated_at, last_seen_at = before.content_updated_at, before.last_seen_at
 
-    second = sync(client, a, connection["id"]).json()
-    assert (second["inserted"], second["updated"], second["unchanged"]) == (0, 0, 3)
+    assert sync(client, a, connection["id"]).status_code == 202
+    work(session, yelp)
+    job = latest_job(client, a, connection["id"])
+    assert (job["inserted"], job["updated"], job["unchanged"]) == (0, 0, 3)
     after = stored(session, newest["external_review_id"])
     assert after.content_updated_at == content_updated_at
     assert after.last_seen_at > last_seen_at
     connection = client.get(f"/v1/connections/{connection['id']}", headers=headers(a)).json()
-    assert (datetime.fromisoformat(connection["last_synced_at"])
-            == datetime.fromisoformat(second["synced_at"]))
+    assert connection["sync_status"] == "ok" and connection["last_sync_error"] is None
+    assert connection["last_synced_at"] == job["finished_at"]
 
 
 def test_edited_review_updates_content_and_timestamp(client, session, tenants, yelp):
     a = tenants[0]
     connection_id = connected(client, a)["id"]
     yelp.raw = [raw(1), raw(2)]
-    sync(client, a, connection_id)
+    work(session, yelp)
     original = stored(session, "review1").content_updated_at
     untouched = stored(session, "review2").content_updated_at
     yelp.raw = [raw(1, rating=3, text="Updated: billing was slow."), raw(2)]
-    result = sync(client, a, connection_id).json()
-    assert (result["inserted"], result["updated"], result["unchanged"]) == (0, 1, 1)
+    sync(client, a, connection_id)
+    work(session, yelp)
+    job = latest_job(client, a, connection_id)
+    assert (job["inserted"], job["updated"], job["unchanged"]) == (0, 1, 1)
     edited = stored(session, "review1")
     assert edited.rating == 3 and edited.text == "Updated: billing was slow."
     assert edited.content_updated_at > original
     assert stored(session, "review2").content_updated_at == untouched
 
 
-def test_missing_review_is_not_a_deletion(client, tenants, yelp):
+def test_missing_review_is_not_a_deletion(client, session, tenants, yelp):
     a = tenants[0]
     connection_id = connected(client, a)["id"]
     yelp.raw = [raw(1), raw(2)]
-    sync(client, a, connection_id)
+    work(session, yelp)
     yelp.raw = [raw(1)]
-    result = sync(client, a, connection_id).json()
-    assert (result["fetched"], result["unchanged"]) == (1, 1)
+    sync(client, a, connection_id)
+    work(session, yelp)
+    job = latest_job(client, a, connection_id)
+    assert (job["fetched"], job["unchanged"]) == (1, 1)
     assert feed(client, a)["meta"]["total"] == 2
 
 
@@ -138,10 +160,26 @@ def test_bad_entries_are_rejected_individually(client, session, tenants, yelp):
         {**raw(12), "url": "http://yelp.invalid/insecure"},
         raw(1, text="duplicate of the first"), "not an object",
     ]
-    result = sync(client, a, connection_id).json()
-    assert (result["fetched"], result["inserted"], result["rejected"]) == (14, 2, 12)
+    work(session, yelp)
+    job = latest_job(client, a, connection_id)
+    assert (job["fetched"], job["inserted"], job["rejected"]) == (14, 2, 12)
     assert stored(session, "review1").text == "Great visit."
     assert len(stored(session, "review2").text) == 160
+
+
+def test_sync_request_returns_the_unfinished_job(client, session, tenants, yelp):
+    a = tenants[0]
+    connection_id = connected(client, a)["id"]
+    first = latest_job(client, a, connection_id)
+    assert first["status"] == "queued"
+    for _ in range(2):
+        response = sync(client, a, connection_id)
+        assert response.status_code == 202
+        assert response.json()["id"] == first["id"]
+    work(session, yelp)
+    response = sync(client, a, connection_id)
+    assert response.status_code == 202
+    assert response.json()["id"] != first["id"] and response.json()["status"] == "queued"
 
 
 def test_sync_refuses_disabled_connection(client, tenants, yelp):
@@ -149,6 +187,7 @@ def test_sync_refuses_disabled_connection(client, tenants, yelp):
     connection_id = connected(client, a)["id"]
     client.post(f"/v1/connections/{connection_id}/disable", headers=headers(a),
                 json={"reason": "no_longer_needed"})
+    assert latest_job(client, a, connection_id)["status"] == "cancelled"
     response = sync(client, a, connection_id)
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "connection_disabled"
@@ -165,59 +204,42 @@ def test_disable_during_provider_call_writes_nothing(client, session, tenants, y
         session.commit()
 
     yelp.during_fetch = disable_now
-    response = sync(client, a, connection_id)
-    assert response.status_code == 409
+    assert work(session, yelp) == ["cancelled"]
+    job = latest_job(client, a, connection_id)
+    assert (job["status"], job["error_code"]) == ("cancelled", "connection_disabled")
     assert session.scalar(select(func.count()).select_from(Review)) == 0
 
 
-def test_cooldown_limits_repeated_syncs(client, tenants, yelp, monkeypatch):
+def test_cooldown_limits_repeated_syncs(client, session, tenants, yelp, monkeypatch):
     monkeypatch.setattr(settings(), "sync_cooldown_seconds", 300)
     a = tenants[0]
     connection_id = connected(client, a)["id"]
-    assert sync(client, a, connection_id).status_code == 200
+    work(session, yelp)
     response = sync(client, a, connection_id)
     assert response.status_code == 429
     assert response.json()["error"]["code"] == "sync_cooldown"
     assert 0 < int(response.headers["retry-after"]) <= 300
 
 
-def test_provider_outage_releases_the_cooldown(client, tenants, yelp, monkeypatch):
-    monkeypatch.setattr(settings(), "sync_cooldown_seconds", 300)
-    a = tenants[0]
-    connection_id = connected(client, a)["id"]
-    yelp.down = True
-    response = sync(client, a, connection_id)
-    assert response.status_code == 503
-    assert response.headers["retry-after"] == "30"
-    yelp.down = False
-    assert sync(client, a, connection_id).status_code == 200
-
-
-def test_business_removed_from_provider(client, tenants, yelp):
-    a = tenants[0]
-    connection_id = connected(client, a)["id"]
-    yelp.missing = True
-    response = sync(client, a, connection_id)
-    assert response.status_code == 422
-    assert response.json()["error"]["code"] == "business_not_found"
-
-
-def test_cross_tenant_isolation(client, tenants, yelp):
+def test_cross_tenant_isolation(client, session, tenants, yelp):
     a, b = tenants
     connection = connected(client, a)
-    sync(client, a, connection["id"])
+    work(session, yelp)
     account_id = client.get(f"/v1/locations/{connection['location_id']}",
                             headers=headers(a)).json()["account_id"]
+    job_id = latest_job(client, a, connection["id"])["id"]
+    for path in [f"/v1/accounts/{account_id}/reviews", f"/v1/sync-jobs/{job_id}",
+                 f"/v1/connections/{connection['id']}/sync-jobs"]:
+        assert client.get(path, headers=headers(b)).status_code == 404
     assert sync(client, b, connection["id"]).status_code == 404
     assert feed(client, b)["meta"]["total"] == 0
-    assert client.get(f"/v1/accounts/{account_id}/reviews", headers=headers(b)).status_code == 404
 
 
-def test_feeds_scope_by_account_and_hide_disabled(client, tenants, yelp):
+def test_feeds_scope_by_account_and_hide_disabled(client, session, tenants, yelp):
     a = tenants[0]
-    first, second = connected(client, a, n=1), connected(client, a, n=2)
-    for connection in [first, second]:
-        sync(client, a, connection["id"])
+    first = connected(client, a, n=1)
+    connected(client, a, n=2)
+    work(session, yelp)
     account_id = client.get(f"/v1/locations/{first['location_id']}",
                             headers=headers(a)).json()["account_id"]
     account_feed = f"/v1/accounts/{account_id}/reviews"
@@ -232,9 +254,10 @@ def test_feeds_scope_by_account_and_hide_disabled(client, tenants, yelp):
     assert feed(client, a, account_feed)["meta"]["total"] == 0
 
 
-def test_feed_pagination(client, tenants, yelp):
+def test_feed_pagination(client, session, tenants, yelp):
     a = tenants[0]
-    sync(client, a, connected(client, a)["id"])
+    connected(client, a)
+    work(session, yelp)
     first = feed(client, a, "/v1/partner/reviews?limit=2&page=1")
     second = feed(client, a, "/v1/partner/reviews?limit=2&page=2")
     assert first["meta"] == {"page": 1, "limit": 2, "total": 3, "last_page": 2}

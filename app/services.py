@@ -2,15 +2,24 @@ import math
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app import jobs
 from app.auth import Scope
 from app.config import settings
 from app.errors import ServiceError, not_found
-from app.models import Account, Location, Partner, Review, ReviewSiteConnection
-from app.reviews import normalize_yelp
+from app.models import (
+    Account,
+    Location,
+    Partner,
+    Review,
+    ReviewSiteConnection,
+    SyncAttempt,
+    SyncJob,
+)
+from app.schemas import SyncJobOut
 from app.yelp import BusinessNotFound, ProviderUnavailable, YelpClient
 
 CONNECTION_CONFLICTS = {
@@ -114,11 +123,15 @@ def create_connection(session: Session, scope: Scope, yelp: YelpClient, location
         raise business_not_found() from None
     except ProviderUnavailable:
         raise provider_unavailable() from None
+    now = datetime.now(UTC)
     result = ReviewSiteConnection(partner_id=scope.partner_id, location_id=location_id,
                                   provider=provider, external_business_id=external_business_id,
-                                  verified_at=datetime.now(UTC))
+                                  verified_at=now)
     session.add(result)
     try:
+        session.flush()
+        # Queue the first collection with the connection, in the same transaction.
+        jobs.enqueue(session, result, now)
         session.commit()
     except IntegrityError as error:
         # The partial unique indexes are the source of truth, so concurrent requests
@@ -149,8 +162,11 @@ def disable_connection(session: Session, scope: Scope, connection_id: UUID, reas
     """Repeating the call returns the connection unchanged, keeping the original reason."""
     result = connection(session, scope, connection_id)
     if result.disabled_at is None:
-        result.disabled_at = datetime.now(UTC)
+        now = datetime.now(UTC)
+        result.disabled_at = now
         result.disabled_reason = reason
+        session.flush()
+        jobs.cancel_queued(session, connection_id, now)
         session.commit()
         session.refresh(result)
     return result
@@ -170,86 +186,57 @@ def provider_unavailable():
                         headers={"Retry-After": "30"})
 
 
-def _claim_sync(session: Session, scope: Scope, connection_id: UUID, now: datetime):
-    """Atomically claims the connection's sync slot, so concurrent or repeated requests
-    cannot spend provider quota. Returns the previous claim so a failed call can undo it."""
+def _unfinished_job(session: Session, connection_id: UUID):
+    return session.scalar(select(SyncJob).where(SyncJob.connection_id == connection_id,
+                                                SyncJob.status.in_(["queued", "running"])))
+
+
+def request_sync(session: Session, scope: Scope, connection_id: UUID):
+    """Queues a sync and returns its job. While one is unfinished, returns that job instead,
+    so repeating the request is harmless. A cooldown since the last job protects quota."""
     current = connection(session, scope, connection_id)
     if current.disabled_at is not None:
         raise connection_disabled()
-    previous = current.sync_claimed_at
-    cooldown = timedelta(seconds=settings().sync_cooldown_seconds)
-    claimed = session.scalar(update(ReviewSiteConnection).where(
-        ReviewSiteConnection.id == connection_id,
-        ReviewSiteConnection.disabled_at.is_(None),
-        or_(ReviewSiteConnection.sync_claimed_at.is_(None),
-            ReviewSiteConnection.sync_claimed_at <= now - cooldown),
-    ).values(sync_claimed_at=now).returning(ReviewSiteConnection.id))
-    if claimed is None:
-        session.rollback()
-        session.refresh(current)
-        if current.disabled_at is not None:
-            raise connection_disabled()
-        wait = cooldown - (now - current.sync_claimed_at)
-        raise ServiceError(429, "sync_cooldown", "Connection was synced recently; retry later",
-                           headers={"Retry-After": str(max(1, math.ceil(wait.total_seconds())))})
-    session.commit()
-    return current, previous
-
-
-def sync_connection(session: Session, scope: Scope, yelp: YelpClient, connection_id: UUID):
+    existing = _unfinished_job(session, connection_id)
+    if existing is not None:
+        return existing
     now = datetime.now(UTC)
-    current, previous = _claim_sync(session, scope, connection_id, now)
-    business_id = current.external_business_id
-    # Outbound provider calls happen outside database transactions.
+    cooldown = timedelta(seconds=settings().sync_cooldown_seconds)
+    latest = session.scalar(select(func.max(SyncJob.created_at))
+        .where(SyncJob.connection_id == connection_id))
+    if latest is not None and latest > now - cooldown:
+        wait = math.ceil((latest + cooldown - now).total_seconds())
+        raise ServiceError(429, "sync_cooldown", "Connection was synced recently; retry later",
+                           headers={"Retry-After": str(max(1, wait))})
+    job = jobs.enqueue(session, current, now)
     try:
-        raw = yelp.reviews(business_id)
-    except ProviderUnavailable:
-        # Give the slot back so the partner can retry once the provider recovers.
-        session.execute(update(ReviewSiteConnection).where(
-            ReviewSiteConnection.id == connection_id,
-            ReviewSiteConnection.sync_claimed_at == now,
-        ).values(sync_claimed_at=previous))
         session.commit()
-        raise provider_unavailable() from None
-    except BusinessNotFound:
-        raise business_not_found() from None
-    reviews, rejected = normalize_yelp(raw)
-
-    # Disabling takes the same row lock, so a disable during the provider call is seen here
-    # and nothing is written to a disabled connection.
-    locked = session.scalar(select(ReviewSiteConnection)
-        .where(ReviewSiteConnection.id == connection_id)
-        .with_for_update().execution_options(populate_existing=True))
-    if locked.disabled_at is not None:
+    except IntegrityError as error:
+        # A concurrent request queued one first; return that job.
         session.rollback()
-        raise connection_disabled()
-    existing = {row.external_review_id: row for row in session.scalars(select(Review).where(
-        Review.connection_id == connection_id,
-        Review.external_review_id.in_([review.external_review_id for review in reviews]),
-    ))}
-    inserted = updated = 0
-    for review in reviews:
-        content = {"rating": review.rating, "text": review.text,
-                   "author_name": review.author_name, "review_url": review.review_url,
-                   "reviewed_at": review.reviewed_at, "content_hash": review.content_hash()}
-        row = existing.get(review.external_review_id)
-        if row is None:
-            session.add(Review(partner_id=locked.partner_id, connection_id=connection_id,
-                               external_review_id=review.external_review_id,
-                               content_updated_at=now, last_seen_at=now, **content))
-            inserted += 1
-            continue
-        row.last_seen_at = now
-        if row.content_hash != content["content_hash"]:
-            for key, value in content.items():
-                setattr(row, key, value)
-            row.content_updated_at = now
-            updated += 1
-    locked.last_synced_at = now
-    session.commit()
-    return {"connection_id": connection_id, "synced_at": now, "fetched": len(raw),
-            "inserted": inserted, "updated": updated,
-            "unchanged": len(reviews) - inserted - updated, "rejected": rejected}
+        if error.orig.diag.constraint_name != "uq_sync_jobs_unfinished":
+            raise
+        return _unfinished_job(session, connection_id)
+    session.refresh(job)
+    return job
+
+
+def sync_job(session: Session, scope: Scope, job_id: UUID):
+    result = session.scalar(select(SyncJob).where(SyncJob.id == job_id,
+                                                  SyncJob.partner_id == scope.partner_id))
+    if result is None:
+        raise not_found()
+    attempts = session.scalars(select(SyncAttempt).where(SyncAttempt.job_id == job_id)
+        .order_by(SyncAttempt.number)).all()
+    return {**SyncJobOut.model_validate(result).model_dump(), "attempt_history": attempts}
+
+
+def sync_jobs(session: Session, scope: Scope, connection_id: UUID, limit: int, page: int):
+    connection(session, scope, connection_id)
+    return session.scalars(select(SyncJob).where(
+        SyncJob.partner_id == scope.partner_id, SyncJob.connection_id == connection_id,
+    ).order_by(SyncJob.created_at.desc(), SyncJob.id)
+        .limit(limit).offset((page - 1) * limit)).all()
 
 
 REVIEW_FIELDS = ["id", "connection_id", "external_review_id", "rating", "text", "author_name",
