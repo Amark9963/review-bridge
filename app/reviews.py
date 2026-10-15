@@ -8,7 +8,7 @@ from app.providers import CAPABILITIES
 
 YELP_EXCERPT_MAX_CHARS = CAPABILITIES["yelp"]["excerpt_max_chars"]
 # Yelp's reference does not state the timezone of time_created. UTC is an assumption to
-# verify against live data (docs/architecture.md, next slice 5).
+# verify if live data is ever evaluated (docs/architecture.md, Live Yelp decision).
 YELP_TIME_ZONE = UTC
 
 

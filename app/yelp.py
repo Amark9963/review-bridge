@@ -1,5 +1,5 @@
-"""Yelp adapter. Only the synthetic implementation exists until eligible live access is
-verified (docs/architecture.md, next slice 5). Synthetic data is invented, never real."""
+"""Yelp adapter. Only the synthetic implementation exists; the project never calls live Yelp
+(docs/architecture.md, Live Yelp decision). Synthetic data is invented, never real."""
 from dataclasses import dataclass
 from typing import Protocol
 
