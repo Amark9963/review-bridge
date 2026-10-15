@@ -11,10 +11,13 @@ review sync from a synthetic Yelp adapter, partner and account review feeds with
 removal notices and cursor-based incremental sync, Swagger, health checks, and PostgreSQL
 integration tests.
 
-Sync jobs run in a separate worker with retries, lease recovery and attempt history.
+Sync jobs run in a separate worker with retries, lease recovery and attempt history. The
+worker also syncs every active connection on a schedule (every 12 hours by default). The
+API and worker write structured JSON logs.
 
-Not implemented yet: live Yelp API calls, scheduled syncing, account
-tokens, rate limiting, or webhooks. Build these one vertical slice at a time.
+Not implemented yet: account tokens, rate limiting, or webhooks. ReviewBridge never calls
+the real Yelp API; see the [Live Yelp decision](docs/architecture.md#live-yelp-decision).
+Build these one vertical slice at a time.
 
 ## Start (Docker Desktop with Linux containers)
 
@@ -103,6 +106,13 @@ docker compose exec api python -m app.cli job-stats
 docker compose stop
 docker compose up -d
 ```
+
+Logs are JSON, one object per line: the API logs each request (request ID, route, status,
+duration, partner and token IDs, never the token itself), and the worker logs each sync
+attempt and each scheduling run. `job-stats` reports `connections_overdue`, connections
+the scheduler should have queued by now. Settings such as `SYNC_INTERVAL_HOURS`,
+`SYNC_COOLDOWN_SECONDS` and `LOG_LEVEL` go in `.env` (see `.env.example`) and take effect
+after `docker compose up -d`.
 
 The named database volume survives container replacement and `docker compose down`.
 Do not use `down -v` unless you intend to delete the local database.

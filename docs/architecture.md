@@ -160,6 +160,37 @@ slightly after a client read past its timestamp. Clients sync like this:
 The overlap re-serves some reviews, which upserting makes harmless. Five minutes covers
 commit delay and modest clock skew between hosts; it is not a hard guarantee.
 
+## Scheduling and logging
+
+Implemented in slice 6a on 2026-10-16 with defaults proposed to the user (no API contract
+changes beyond a new `trigger` field on jobs).
+
+- The worker schedules once a minute: every active connection with no job in the last
+  `SYNC_INTERVAL_HOURS` (default 12; Yelp content may be kept 24 hours, so one missed run
+  still fits) gets a job. Connections in `needs_attention` are skipped, since retrying a
+  business the provider no longer knows only spends quota; a successful partner-requested
+  sync returns them to the schedule. Disabled connections are never scheduled.
+- Scheduling is one `INSERT ... SELECT ... ON CONFLICT DO NOTHING` on the unfinished-job
+  index, so it never duplicates a queued, running or concurrently requested job, and
+  several workers can schedule at once without coordination. Up to 500 jobs per run.
+- Scheduled jobs start at random within 5 minutes, so a batch (for example after a restart)
+  does not reach the provider at once.
+- Jobs record a `trigger`: `connect`, `manual` or `schedule`.
+- Logs are JSON, one object per line, through one formatter for the API, the worker and
+  uvicorn. Context goes in `extra={"fields": ...}`.
+- The API logs one line per request: request ID, method, route template, path without the
+  query string, status, duration, and the caller's partner and token IDs. Never the token,
+  the Authorization header, query strings or review content. Health checks log at DEBUG.
+  uvicorn's access log is disabled in favour of this.
+- The worker logs each sync attempt (job, connection, partner, attempt, trigger, outcome,
+  error code, counts, duration), each scheduling run that queued something, lease recovery
+  and lost leases.
+- `job-stats` adds `connections_overdue`: schedulable connections with no job for an hour
+  past their interval, the signal that scheduling has stopped.
+- Settings reach containers only through `compose.yaml`; `.env` is not in the image. Until
+  this slice that included `SYNC_COOLDOWN_SECONDS`, which the README described as
+  configurable but which had no effect in Compose.
+
 ## Next slices
 
 1. ~~Location review-site connections and capabilities (Yelp only).~~ Done; see Connections.
@@ -171,7 +202,8 @@ commit delay and modest clock skew between hosts; it is not a hard guarantee.
    see Feed filters and incremental sync.
 5. Live-ready Yelp adapter, never switched on (see Live Yelp decision). Done after slice 6.
 6. Scheduling, inbound rate limits, account tokens and operational logging, in two parts:
-   6a scheduling and structured logging; 6b account tokens and inbound rate limits.
+   ~~6a scheduling and structured logging~~ (done; see Scheduling and logging); 6b account
+   tokens and inbound rate limits.
 7. Optional signed outbound webhooks with stable event IDs and durable deduplication.
 
 ### Live Yelp decision

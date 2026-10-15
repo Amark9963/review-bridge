@@ -146,6 +146,8 @@ class SyncJob(Identity, Base):
         CheckConstraint(
             "status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')",
             name="ck_sync_jobs_status"),
+        CheckConstraint("trigger IN ('connect', 'manual', 'schedule')",
+                        name="ck_sync_jobs_trigger"),
         Index("uq_sync_jobs_unfinished", "connection_id", unique=True,
               postgresql_where=UNFINISHED),
         Index("ix_sync_jobs_due", "run_after", postgresql_where=text("status = 'queued'")),
@@ -154,6 +156,8 @@ class SyncJob(Identity, Base):
     partner_id: Mapped[UUID]
     connection_id: Mapped[UUID]
     status: Mapped[str] = mapped_column(String(16))
+    # Why the job exists: a new connection, a partner's request, or the schedule.
+    trigger: Mapped[str] = mapped_column(String(16))
     attempts: Mapped[int]
     max_attempts: Mapped[int]
     run_after: Mapped[datetime] = mapped_column(DateTime(timezone=True))

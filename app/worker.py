@@ -15,7 +15,8 @@ from datetime import timedelta
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import jobs
+from app import jobs, logs
+from app.config import settings
 from app.db import engine
 from app.models import WorkerHeartbeat
 from app.yelp import yelp_client
@@ -25,6 +26,7 @@ log = logging.getLogger("app.worker")
 POLL_SECONDS = 2
 HEARTBEAT_EVERY = timedelta(seconds=5)
 HEALTHY_WITHIN = timedelta(seconds=30)
+SCHEDULE_EVERY = timedelta(seconds=60)
 
 
 def check() -> int:
@@ -43,8 +45,11 @@ def run_forever():
     for signum in (signal.SIGTERM, signal.SIGINT):
         signal.signal(signum, lambda *_: stop.set())
     yelp = yelp_client()
-    last_beat = None
-    log.info("Worker %s started", worker_id)
+    interval = timedelta(hours=settings().sync_interval_hours)
+    last_beat = last_schedule = None
+    fields = {"worker_id": worker_id}
+    log.info("worker started", extra={"fields": {
+        **fields, "sync_interval_hours": settings().sync_interval_hours}})
     with Session(engine()) as session:
         while not stop.is_set():
             try:
@@ -53,18 +58,20 @@ def run_forever():
                     jobs.heartbeat(session, worker_id, started_at, now)
                     jobs.recover_expired(session, now)
                     last_beat = now
+                if last_schedule is None or now - last_schedule >= SCHEDULE_EVERY:
+                    jobs.schedule_due(session, now, interval)
+                    last_schedule = now
                 job = jobs.claim(session, worker_id, now)
                 if job is None:
                     stop.wait(POLL_SECONDS)
                     continue
-                outcome = jobs.run(session, yelp, job, worker_id)
-                log.info("Job %s finished attempt %s: %s", job.id, job.attempts, outcome)
+                jobs.run(session, yelp, job, worker_id)
             except Exception:
                 # Never let one bad job stop the worker; its lease expires and it is retried.
-                log.exception("Worker loop error")
+                log.exception("worker loop error", extra={"fields": fields})
                 session.rollback()
                 stop.wait(POLL_SECONDS)
-    log.info("Worker %s stopped", worker_id)
+    log.info("worker stopped", extra={"fields": fields})
 
 
 def main():
@@ -73,7 +80,7 @@ def main():
     args = parser.parse_args()
     if args.check:
         sys.exit(check())
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logs.configure(settings().log_level)
     run_forever()
 
 

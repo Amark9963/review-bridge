@@ -4,12 +4,13 @@ import json
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import exists, func, select
 from sqlalchemy.orm import Session
 
 from app.auth import issue_token
+from app.config import settings
 from app.db import engine
-from app.models import ApiToken, Partner, SyncJob, WorkerHeartbeat
+from app.models import ApiToken, Partner, ReviewSiteConnection, SyncJob, WorkerHeartbeat
 from app.schemas import CreateNamed
 
 
@@ -55,7 +56,8 @@ def main():
 
 
 def job_stats(session: Session) -> dict:
-    """A growing oldest_due_seconds is the first sign that workers are stuck or missing."""
+    """A growing oldest_due_seconds is the first sign that workers are stuck or missing;
+    connections_overdue counts connections the scheduler should have queued by now."""
     now = datetime.now(UTC)
     day_ago = now - timedelta(days=1)
     due = SyncJob.status == "queued", SyncJob.run_after <= now
@@ -71,9 +73,20 @@ def job_stats(session: Session) -> dict:
         "running": count(SyncJob.status == "running"),
         "succeeded_24h": count(SyncJob.status == "succeeded", SyncJob.finished_at >= day_ago),
         "failed_24h": count(SyncJob.status == "failed", SyncJob.finished_at >= day_ago),
+        "connections_overdue": overdue(session, now),
         "workers_alive": session.scalar(select(func.count()).select_from(WorkerHeartbeat)
             .where(WorkerHeartbeat.last_seen_at >= now - timedelta(seconds=30))),
     }
+
+
+def overdue(session: Session, now: datetime) -> int:
+    """Active, schedulable connections with no job for an hour past their interval."""
+    since = now - timedelta(hours=settings().sync_interval_hours + 1)
+    recent = exists().where(SyncJob.connection_id == ReviewSiteConnection.id,
+                            SyncJob.created_at > since)
+    return session.scalar(select(func.count()).select_from(ReviewSiteConnection).where(
+        ReviewSiteConnection.disabled_at.is_(None),
+        ReviewSiteConnection.sync_status != "needs_attention", ~recent))
 
 
 if __name__ == "__main__":

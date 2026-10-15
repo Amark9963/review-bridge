@@ -133,7 +133,7 @@ def create_connection(session: Session, scope: Scope, yelp: YelpClient, location
     try:
         session.flush()
         # Queue the first collection with the connection, in the same transaction.
-        jobs.enqueue(session, result, now)
+        jobs.enqueue(session, result, now, "connect")
         session.commit()
     except IntegrityError as error:
         # The partial unique indexes are the source of truth, so concurrent requests
@@ -221,7 +221,7 @@ def request_sync(session: Session, scope: Scope, connection_id: UUID):
         wait = math.ceil((latest + cooldown - now).total_seconds())
         raise ServiceError(429, "sync_cooldown", "Connection was synced recently; retry later",
                            headers={"Retry-After": str(max(1, wait))})
-    job = jobs.enqueue(session, current, now)
+    job = jobs.enqueue(session, current, now, "manual")
     try:
         session.commit()
     except IntegrityError as error:
