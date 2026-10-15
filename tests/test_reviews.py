@@ -277,5 +277,6 @@ def test_database_rejects_cross_tenant_review(client, session, tenants, yelp):
         session.add(Review(partner_id=b[0].id, connection_id=connection_id,
                            external_review_id="x", rating=5, text="x", author_name="x",
                            review_url="https://yelp.invalid", reviewed_at=now,
-                           content_hash="x", content_updated_at=now, last_seen_at=now))
+                           content_hash="x", content_updated_at=now, last_seen_at=now,
+                           updated_at=now))
         session.flush()

@@ -24,6 +24,7 @@ from app.schemas import (
     DisableConnection,
     LocationOut,
     PartnerOut,
+    ReviewFeedQuery,
     ReviewPageOut,
     ReviewSiteOut,
     SyncJobDetailOut,
@@ -181,12 +182,14 @@ def get_sync_job(job_id: UUID, session: DB, scope: Auth):
     return services.sync_job(session, scope, job_id)
 
 
+FeedQuery = Annotated[ReviewFeedQuery, Query()]
+
+
 @app.get("/v1/partner/reviews", response_model=ReviewPageOut, tags=["reviews"])
-def partner_reviews(session: DB, scope: Auth, limit: Limit = 25, page: Page = 1):
-    return services.review_feed(session, scope, limit, page)
+def partner_reviews(session: DB, scope: Auth, query: FeedQuery):
+    return services.review_feed(session, scope, query)
 
 
 @app.get("/v1/accounts/{account_id}/reviews", response_model=ReviewPageOut, tags=["reviews"])
-def account_reviews(account_id: UUID, session: DB, scope: Auth, limit: Limit = 25,
-                    page: Page = 1):
-    return services.review_feed(session, scope, limit, page, account_id)
+def account_reviews(account_id: UUID, session: DB, scope: Auth, query: FeedQuery):
+    return services.review_feed(session, scope, query, account_id)

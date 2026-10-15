@@ -7,8 +7,9 @@ SAU integration patterns. Independent project; not affiliated with SAU or Yelp.
 
 Implemented: PostgreSQL migrations, partner API tokens, scoped account/location creation
 and reads, Yelp connections for locations with declared provider capabilities, on-demand
-review sync from a synthetic Yelp adapter, partner and account review feeds, Swagger,
-health checks, and PostgreSQL integration tests.
+review sync from a synthetic Yelp adapter, partner and account review feeds with filters,
+removal notices and cursor-based incremental sync, Swagger, health checks, and PostgreSQL
+integration tests.
 
 Sync jobs run in a separate worker with retries, lease recovery and attempt history.
 
@@ -62,11 +63,17 @@ In Swagger, choose **Authorize**, paste the raw `rb_...` token, then:
    while one is unfinished returns the same job, and within five minutes of the last job
    returns `429` (set `SYNC_COOLDOWN_SECONDS` to change this). Read reviews with
    `GET /v1/partner/reviews` or `GET /v1/accounts/{account_id}/reviews`; disabled
-   connections' reviews are hidden.
-9. Create a second partner/token and try the first partner's IDs: expect `404`.
+   connections' reviews are hidden unless you pass `include_removed=true`.
+9. Filter the feed, for example `?rating=4&rating=5&reviewed_from=2026-02-01T00:00:00Z`.
+   To copy reviews incrementally, request `?sort=updated_at&include_removed=true`, follow
+   `meta.next_cursor` until it is null, and next time add `updated_since` set to when that
+   sync started minus five minutes. Reviews with `removed_at` set should be deleted.
+10. Create a second partner/token and try the first partner's IDs: expect `404`.
 
-List endpoints return arrays with `page` (default 1) and `limit` (default 25, maximum 100).
-These are current onboarding contracts; the future review feed will have pagination metadata.
+Other list endpoints return arrays with `page` (default 1) and `limit` (default 25,
+maximum 100). The review feeds return `data` and `meta`; see
+[Feed filters and incremental sync](docs/architecture.md#feed-filters-and-incremental-sync)
+for every parameter and the freshness contract.
 
 ## Token operations
 

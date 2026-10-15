@@ -82,14 +82,15 @@ def _write_reviews(session: Session, connection: ReviewSiteConnection,
         if row is None:
             session.add(Review(partner_id=connection.partner_id, connection_id=connection.id,
                                external_review_id=review.external_review_id,
-                               content_updated_at=now, last_seen_at=now, **content))
+                               content_updated_at=now, last_seen_at=now, updated_at=now,
+                               **content))
             inserted += 1
             continue
         row.last_seen_at = now
         if row.content_hash != content["content_hash"]:
             for key, value in content.items():
                 setattr(row, key, value)
-            row.content_updated_at = now
+            row.content_updated_at = row.updated_at = now
             updated += 1
     return {"inserted": inserted, "updated": updated,
             "unchanged": len(reviews) - inserted - updated}
@@ -146,7 +147,6 @@ def run(session: Session, yelp: YelpClient, job: SyncJob, worker_id: str,
         log.exception("Unexpected provider error for job %s", job_id)
         error_code = "unexpected_error"
     reviews, rejected = normalize_yelp(raw) if raw is not None else ([], 0)
-    now = clock()
 
     job = session.scalar(select(SyncJob).where(SyncJob.id == job_id)
         .with_for_update().execution_options(populate_existing=True))
@@ -160,6 +160,9 @@ def run(session: Session, yelp: YelpClient, job: SyncJob, worker_id: str,
     connection = session.scalar(select(ReviewSiteConnection)
         .where(ReviewSiteConnection.id == connection_id)
         .with_for_update().execution_options(populate_existing=True))
+    # Read the clock only once the locks are held, just before writing: review updated_at
+    # then follows the order in which writes commit, as closely as one clock read allows.
+    now = clock()
     if connection.disabled_at is not None:
         _finish(job, attempt, "cancelled", "cancelled", now, "connection_disabled")
     elif error_code is not None:
