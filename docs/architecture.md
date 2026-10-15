@@ -30,7 +30,8 @@ Approved by the user on 2026-10-11 and implemented in the second slice.
   timeouts, errors and rate limits return 503 `provider_unavailable` with `Retry-After`.
   Nothing is stored on failure. The trade-off: connecting is unavailable while Yelp is.
 - The Yelp adapter has a synthetic implementation (invented businesses, no network) selected
-  by `YELP_MODE`; the live implementation arrives with authorized access (slice 5).
+  by `YELP_MODE`. A live-ready implementation is built in slice 5 but never switched on
+  (see Live Yelp decision).
 - Yelp's name, address and URL are returned once in the create response for the partner to
   confirm the business, and never stored, until Yelp's caching terms are resolved.
 - One active connection per provider per location, and within a partner one active location
@@ -114,7 +115,7 @@ scheduled collection, no on-demand endpoint); SAU's internals are not public.
 - Disabling cancels queued jobs with one conditional `UPDATE ... WHERE status = 'queued'`,
   so a job a worker claims at the same moment is left running and cancels itself.
 - The lease is not renewed during the provider call. The synthetic adapter returns at once;
-  before live Yelp (slice 5), keep the provider timeout well under the 60-second lease or
+  the live-ready adapter (slice 5) must keep its timeout well under the 60-second lease or
   renew it, otherwise a slow call can be recovered and fetched twice (writes stay safe).
 
 ## Feed filters and incremental sync
@@ -159,6 +160,37 @@ slightly after a client read past its timestamp. Clients sync like this:
 The overlap re-serves some reviews, which upserting makes harmless. Five minutes covers
 commit delay and modest clock skew between hosts; it is not a hard guarantee.
 
+## Scheduling and logging
+
+Implemented in slice 6a on 2026-10-16 with defaults proposed to the user (no API contract
+changes beyond a new `trigger` field on jobs).
+
+- The worker schedules once a minute: every active connection with no job in the last
+  `SYNC_INTERVAL_HOURS` (default 12; Yelp content may be kept 24 hours, so one missed run
+  still fits) gets a job. Connections in `needs_attention` are skipped, since retrying a
+  business the provider no longer knows only spends quota; a successful partner-requested
+  sync returns them to the schedule. Disabled connections are never scheduled.
+- Scheduling is one `INSERT ... SELECT ... ON CONFLICT DO NOTHING` on the unfinished-job
+  index, so it never duplicates a queued, running or concurrently requested job, and
+  several workers can schedule at once without coordination. Up to 500 jobs per run.
+- Scheduled jobs start at random within 5 minutes, so a batch (for example after a restart)
+  does not reach the provider at once.
+- Jobs record a `trigger`: `connect`, `manual` or `schedule`.
+- Logs are JSON, one object per line, through one formatter for the API, the worker and
+  uvicorn. Context goes in `extra={"fields": ...}`.
+- The API logs one line per request: request ID, method, route template, path without the
+  query string, status, duration, and the caller's partner and token IDs. Never the token,
+  the Authorization header, query strings or review content. Health checks log at DEBUG.
+  uvicorn's access log is disabled in favour of this.
+- The worker logs each sync attempt (job, connection, partner, attempt, trigger, outcome,
+  error code, counts, duration), each scheduling run that queued something, lease recovery
+  and lost leases.
+- `job-stats` adds `connections_overdue`: schedulable connections with no job for an hour
+  past their interval, the signal that scheduling has stopped.
+- Settings reach containers only through `compose.yaml`; `.env` is not in the image. Until
+  this slice that included `SYNC_COOLDOWN_SECONDS`, which the README described as
+  configurable but which had no effect in Compose.
+
 ## Next slices
 
 1. ~~Location review-site connections and capabilities (Yelp only).~~ Done; see Connections.
@@ -168,9 +200,29 @@ commit delay and modest clock skew between hosts; it is not a hard guarantee.
    health.~~ Done; see Sync jobs and worker.
 4. ~~Feed filters, updated_since, page validation, eventual-consistency contract.~~ Done;
    see Feed filters and incremental sync.
-5. Authorized live Yelp evaluation with content expiry and no unsupported completeness claims.
-6. Scheduling, inbound rate limits, account tokens and operational logging.
+5. Live-ready Yelp adapter, never switched on (see Live Yelp decision). Done after slice 6.
+6. Scheduling, inbound rate limits, account tokens and operational logging, in two parts:
+   ~~6a scheduling and structured logging~~ (done; see Scheduling and logging); 6b account
+   tokens and inbound rate limits.
 7. Optional signed outbound webhooks with stable event IDs and durable deduplication.
+
+### Live Yelp decision
+
+Decided by the user on 2026-10-16. ReviewBridge is a learning and portfolio project, so it
+stays on the synthetic adapter and never calls the real Yelp API. Live access would add
+cost (an eligible, possibly paid plan), compliance work, and a secret to manage, for data
+that could not be shown publicly and that reviewers could not run themselves.
+
+Slice 5 instead builds the live adapter as it would ship, and tests it without Yelp:
+
+- An HTTP adapter behind `YELP_MODE=live`, with request timeouts well under the worker's
+  60-second lease and an explicit retry/fail rule for each response (401, 404, 429 with
+  `Retry-After`, 5xx, timeouts, malformed bodies).
+- Tests against a fake Yelp server (`httpx` mock transport), not the network.
+- The API key never appears in logs, errors, or the repository.
+- 24-hour content expiry, demonstrated on synthetic data.
+- Documentation stating plainly that it has never run against Yelp, and what a live
+  evaluation would have to confirm (for example the timezone of `time_created`).
 
 Review identity will be (connection_id, external_review_id). Unchanged observations
 must not advance the review's content updated_at. Missing sample entries are not deletions.

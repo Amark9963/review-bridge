@@ -156,7 +156,7 @@ def test_database_allows_one_unfinished_job_per_connection(client, session, tena
     existing = session.scalar(select(SyncJob).where(SyncJob.connection_id == connection_id))
     with pytest.raises(IntegrityError), session.begin_nested():
         session.add(SyncJob(partner_id=existing.partner_id, connection_id=connection_id,
-                            status="queued", attempts=0, max_attempts=5,
+                            status="queued", trigger="manual", attempts=0, max_attempts=5,
                             run_after=jobs.utcnow()))
         session.flush()
 
@@ -180,7 +180,7 @@ def committed_job(session):
             external_business_id="rbtest0000000000000099", verified_at=jobs.utcnow())
         setup.add(connection)
         setup.flush()
-        job = jobs.enqueue(setup, connection, jobs.utcnow())
+        job = jobs.enqueue(setup, connection, jobs.utcnow(), "connect")
         setup.commit()
         ids = partner.id, connection.id, job.id
     yield ids

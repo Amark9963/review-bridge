@@ -6,11 +6,12 @@ stalled worker whose job was recovered cannot overwrite the newer attempt's work
 """
 import logging
 import random
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -36,11 +37,12 @@ def backoff(attempt: int, rng: Callable[[], float] = random.random) -> timedelta
     return timedelta(seconds=base * (0.8 + 0.4 * rng()))
 
 
-def enqueue(session: Session, connection: ReviewSiteConnection, now: datetime) -> SyncJob:
+def enqueue(session: Session, connection: ReviewSiteConnection, now: datetime,
+            trigger: str) -> SyncJob:
     """Adds a queued job without committing. The unfinished-job index rejects a second one."""
     job = SyncJob(partner_id=connection.partner_id, connection_id=connection.id,
-                  status="queued", attempts=0, max_attempts=MAX_ATTEMPTS, run_after=now,
-                  created_at=now)
+                  status="queued", trigger=trigger, attempts=0, max_attempts=MAX_ATTEMPTS,
+                  run_after=now, created_at=now)
     session.add(job)
     return job
 
@@ -133,6 +135,9 @@ def run(session: Session, yelp: YelpClient, job: SyncJob, worker_id: str,
     """Runs one claimed attempt. Returns the attempt's outcome, or `lease_lost`."""
     job_id, number = job.id, job.attempts
     connection_id = job.connection_id
+    fields = {"job_id": job_id, "connection_id": connection_id, "partner_id": job.partner_id,
+              "attempt": number, "trigger": job.trigger}
+    started = time.monotonic()
     business_id = session.get(ReviewSiteConnection, connection_id).external_business_id
     # Outbound provider calls happen outside database transactions.
     session.commit()
@@ -144,7 +149,7 @@ def run(session: Session, yelp: YelpClient, job: SyncJob, worker_id: str,
     except BusinessNotFound:
         error_code = "business_not_found"
     except Exception:
-        log.exception("Unexpected provider error for job %s", job_id)
+        log.exception("unexpected provider error", extra={"fields": fields})
         error_code = "unexpected_error"
     reviews, rejected = normalize_yelp(raw) if raw is not None else ([], 0)
 
@@ -152,7 +157,7 @@ def run(session: Session, yelp: YelpClient, job: SyncJob, worker_id: str,
         .with_for_update().execution_options(populate_existing=True))
     if job.status != "running" or job.lease_owner != worker_id or job.attempts != number:
         session.rollback()
-        log.warning("Lost the lease on job %s attempt %s; discarding its work", job_id, number)
+        log.warning("lease lost; discarding this attempt's work", extra={"fields": fields})
         return "lease_lost"
     attempt = session.scalar(select(SyncAttempt).where(SyncAttempt.job_id == job_id,
                                                        SyncAttempt.number == number))
@@ -176,7 +181,11 @@ def run(session: Session, yelp: YelpClient, job: SyncJob, worker_id: str,
         connection.last_sync_error = None
         connection.last_synced_at = now
     outcome = attempt.outcome
+    result = {key: getattr(job, key) for key in ["fetched", "inserted", "updated", "rejected"]}
     session.commit()
+    log.info("sync attempt finished", extra={"fields": {
+        **fields, "outcome": outcome, "error_code": error_code,
+        "duration_ms": round((time.monotonic() - started) * 1000), **result}})
     return outcome
 
 
@@ -193,7 +202,8 @@ def recover_expired(session: Session, now: datetime) -> int:
             _finish(job, attempt, "cancelled", "lease_expired", now, "connection_disabled")
         else:
             _retry_or_fail(job, attempt, connection, "lease_expired", "lease_expired", now)
-        log.warning("Recovered job %s after its lease expired", job.id)
+        log.warning("recovered a job whose lease expired", extra={"fields": {
+            "job_id": job.id, "connection_id": job.connection_id, "attempt": job.attempts}})
     session.commit()
     return len(jobs)
 
@@ -213,3 +223,36 @@ def cancel_queued(session: Session, connection_id: UUID, now: datetime):
     session.execute(update(SyncJob)
         .where(SyncJob.connection_id == connection_id, SyncJob.status == "queued")
         .values(status="cancelled", finished_at=now, error_code="connection_disabled"))
+
+
+SCHEDULE_BATCH = 500
+# Scheduled jobs start at random within this window, so a batch does not hit the provider
+# at once.
+SCHEDULE_SPREAD = timedelta(minutes=5)
+
+
+def schedule_due(session: Session, now: datetime, interval: timedelta) -> int:
+    """Queues a sync for each active connection with no job in the last `interval`, and
+    commits. Connections needing attention are skipped until a partner's sync succeeds.
+
+    One INSERT ... SELECT: a connection that has an unfinished job, or gets one from a
+    concurrent request or another worker, is skipped by ON CONFLICT on the unfinished-job
+    index, so several workers can schedule at once without duplicates."""
+    scheduled = session.execute(text("""
+        INSERT INTO sync_jobs (id, created_at, partner_id, connection_id, status, trigger,
+                               attempts, max_attempts, run_after)
+        SELECT gen_random_uuid(), :now, c.partner_id, c.id, 'queued', 'schedule',
+               0, :max_attempts, :now + random() * :spread
+        FROM review_site_connections c
+        WHERE c.disabled_at IS NULL AND c.sync_status <> 'needs_attention'
+          AND NOT EXISTS (SELECT 1 FROM sync_jobs j WHERE j.connection_id = c.id
+                          AND (j.status IN ('queued', 'running') OR j.created_at > :since))
+        ORDER BY c.id
+        LIMIT :batch
+        ON CONFLICT (connection_id) WHERE status IN ('queued', 'running') DO NOTHING
+    """), {"now": now, "since": now - interval, "max_attempts": MAX_ATTEMPTS,
+           "spread": SCHEDULE_SPREAD, "batch": SCHEDULE_BATCH}).rowcount
+    session.commit()
+    if scheduled:
+        log.info("scheduled syncs", extra={"fields": {"scheduled": scheduled}})
+    return scheduled

@@ -1,3 +1,5 @@
+import logging
+import time
 from dataclasses import asdict
 from typing import Annotated
 from uuid import UUID, uuid4
@@ -10,8 +12,9 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app import services
+from app import logs, services
 from app.auth import Scope, authenticate
+from app.config import settings
 from app.db import get_session
 from app.errors import ServiceError
 from app.providers import CAPABILITIES
@@ -32,6 +35,9 @@ from app.schemas import (
 )
 from app.yelp import YelpClient, yelp_client
 
+logs.configure(settings().log_level)
+log = logging.getLogger("app.api")
+
 app = FastAPI(title="ReviewBridge", version="0.1.0", description=(
     "Partner-scoped review integration. Provision a token through the operator CLI, then "
     "paste the token into Authorize. Yelp is synthetic: no live Yelp calls are made yet."
@@ -43,12 +49,17 @@ Page = Annotated[int, Query(ge=1)]
 
 
 def current_scope(
+    request: Request,
     session: DB,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
 ) -> Scope:
     if credentials is None:
         raise ServiceError(401, "invalid_token", "Bearer token required")
-    return authenticate(session, credentials.credentials)
+    scope = authenticate(session, credentials.credentials)
+    # For the request log: who called, by IDs only, never the token itself.
+    request.state.partner_id = scope.partner_id
+    request.state.token_id = scope.token_id
+    return scope
 
 
 Auth = Annotated[Scope, Depends(current_scope)]
@@ -56,11 +67,28 @@ Yelp = Annotated[YelpClient, Depends(yelp_client)]
 
 
 @app.middleware("http")
-async def request_id(request: Request, call_next):
+async def request_context(request: Request, call_next):
+    """Assigns the request ID and writes one log line per request. The path is logged
+    without its query string, and the caller only by partner and token IDs."""
     request.state.request_id = str(uuid4())
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = request.state.request_id
-    return response
+    started = time.monotonic()
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        response.headers["X-Request-ID"] = request.state.request_id
+        return response
+    finally:
+        route = request.scope.get("route")
+        # Container health checks poll every few seconds; keep them out of INFO logs.
+        level = logging.DEBUG if request.url.path.startswith("/health/") else logging.INFO
+        log.log(level, "request", extra={"fields": {
+            "request_id": request.state.request_id, "method": request.method,
+            "route": getattr(route, "path", None), "path": request.url.path,
+            "status": status, "duration_ms": round((time.monotonic() - started) * 1000),
+            "partner_id": getattr(request.state, "partner_id", None),
+            "token_id": getattr(request.state, "token_id", None),
+        }})
 
 
 @app.exception_handler(ServiceError)

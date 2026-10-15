@@ -65,6 +65,7 @@ class SyncJobOut(BaseModel):
     created_at: datetime
     connection_id: UUID
     status: Literal["queued", "running", "succeeded", "failed", "cancelled"]
+    trigger: Literal["connect", "manual", "schedule"]
     attempts: int
     max_attempts: int
     run_after: datetime
