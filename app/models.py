@@ -199,12 +199,33 @@ class WorkerHeartbeat(Base):
 
 
 class ApiToken(Identity, Base):
-    """Only partner scope is issued in slice 1. Account scope arrives later."""
+    """A partner token (no account_id) acts on everything under its partner; an account
+    token only on that account and its locations. The composite key keeps an account token
+    inside its own partner."""
 
     __tablename__ = "api_tokens"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["partner_id", "account_id"], ["accounts.partner_id", "accounts.id"],
+            name="fk_api_tokens_account_tenant",
+        ),
+        Index("ix_api_tokens_account_id", "account_id"),
+    )
     partner_id: Mapped[UUID] = mapped_column(ForeignKey("partners.id"), index=True)
+    account_id: Mapped[UUID | None]
     token_hash: Mapped[str] = mapped_column(String(64), unique=True)
     prefix: Mapped[str] = mapped_column(String(16))
     label: Mapped[str] = mapped_column(String(200))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class RateLimitCounter(Base):
+    """Requests per token, per endpoint group, per one-minute window. Old windows are
+    deleted by the worker."""
+
+    __tablename__ = "rate_limit_counters"
+    token_id: Mapped[UUID] = mapped_column(ForeignKey("api_tokens.id"), primary_key=True)
+    bucket: Mapped[str] = mapped_column(String(16), primary_key=True)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    count: Mapped[int]

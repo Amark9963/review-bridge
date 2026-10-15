@@ -13,8 +13,11 @@ from app.models import ApiToken
 
 @dataclass(frozen=True)
 class Scope:
+    """Who is calling. With account_id set, everything is limited to that account."""
+
     partner_id: UUID
     token_id: UUID
+    account_id: UUID | None = None
 
 
 def hash_token(secret: str) -> str:
@@ -22,11 +25,12 @@ def hash_token(secret: str) -> str:
     return hashlib.sha256(secret.encode()).hexdigest()
 
 
-def issue_token(session: Session, partner_id: UUID, label: str, days: int = 90):
+def issue_token(session: Session, partner_id: UUID, label: str, days: int = 90,
+                account_id: UUID | None = None):
     secret = "rb_" + secrets.token_urlsafe(32)
     token = ApiToken(
-        partner_id=partner_id, token_hash=hash_token(secret), prefix=secret[:12], label=label,
-        expires_at=datetime.now(UTC) + timedelta(days=days),
+        partner_id=partner_id, account_id=account_id, token_hash=hash_token(secret),
+        prefix=secret[:12], label=label, expires_at=datetime.now(UTC) + timedelta(days=days),
     )
     session.add(token)
     session.flush()
@@ -41,4 +45,4 @@ def authenticate(session: Session, secret: str) -> Scope:
     ))
     if token is None:
         raise ServiceError(401, "invalid_token", "Missing, invalid, expired, or revoked token")
-    return Scope(partner_id=token.partner_id, token_id=token.id)
+    return Scope(partner_id=token.partner_id, token_id=token.id, account_id=token.account_id)

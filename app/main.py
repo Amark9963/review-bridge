@@ -1,6 +1,7 @@
 import logging
 import time
 from dataclasses import asdict
+from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID, uuid4
 
@@ -12,7 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app import logs, services
+from app import logs, ratelimit, services
 from app.auth import Scope, authenticate
 from app.config import settings
 from app.db import get_session
@@ -21,8 +22,10 @@ from app.providers import CAPABILITIES
 from app.schemas import (
     AccountOut,
     ConnectionOut,
+    CreateAccountToken,
     CreateConnection,
     CreatedConnectionOut,
+    CreatedTokenOut,
     CreateNamed,
     DisableConnection,
     LocationOut,
@@ -32,6 +35,7 @@ from app.schemas import (
     ReviewSiteOut,
     SyncJobDetailOut,
     SyncJobOut,
+    TokenOut,
 )
 from app.yelp import YelpClient, yelp_client
 
@@ -39,8 +43,10 @@ logs.configure(settings().log_level)
 log = logging.getLogger("app.api")
 
 app = FastAPI(title="ReviewBridge", version="0.1.0", description=(
-    "Partner-scoped review integration. Provision a token through the operator CLI, then "
-    "paste the token into Authorize. Yelp is synthetic: no live Yelp calls are made yet."
+    "Partner-scoped review integration. Provision a partner token through the operator "
+    "CLI, then paste it into Authorize; partners can issue account tokens limited to one "
+    "account. Requests are rate limited per token. Yelp is synthetic: ReviewBridge never "
+    "calls the real Yelp API."
 ))
 bearer = HTTPBearer(auto_error=False)
 DB = Annotated[Session, Depends(get_session)]
@@ -58,7 +64,10 @@ def current_scope(
     scope = authenticate(session, credentials.credentials)
     # For the request log: who called, by IDs only, never the token itself.
     request.state.partner_id = scope.partner_id
+    request.state.account_id = scope.account_id
     request.state.token_id = scope.token_id
+    route = getattr(request.scope.get("route"), "path", None)
+    request.state.rate_limit = ratelimit.hit(session, scope.token_id, route, datetime.now(UTC))
     return scope
 
 
@@ -77,6 +86,8 @@ async def request_context(request: Request, call_next):
         response = await call_next(request)
         status = response.status_code
         response.headers["X-Request-ID"] = request.state.request_id
+        if (usage := getattr(request.state, "rate_limit", None)) is not None:
+            response.headers.update(usage.headers())
         return response
     finally:
         route = request.scope.get("route")
@@ -87,6 +98,7 @@ async def request_context(request: Request, call_next):
             "route": getattr(route, "path", None), "path": request.url.path,
             "status": status, "duration_ms": round((time.monotonic() - started) * 1000),
             "partner_id": getattr(request.state, "partner_id", None),
+            "account_id": getattr(request.state, "account_id", None),
             "token_id": getattr(request.state, "token_id", None),
         }})
 
@@ -221,3 +233,29 @@ def partner_reviews(session: DB, scope: Auth, query: FeedQuery):
 @app.get("/v1/accounts/{account_id}/reviews", response_model=ReviewPageOut, tags=["reviews"])
 def account_reviews(account_id: UUID, session: DB, scope: Auth, query: FeedQuery):
     return services.review_feed(session, scope, query, account_id)
+
+
+@app.get("/v1/token", response_model=TokenOut, tags=["tokens"])
+def get_current_token(session: DB, scope: Auth):
+    """The calling token: its type (account_id is null for a partner token) and expiry."""
+    return services.current_token(session, scope)
+
+
+@app.post("/v1/accounts/{account_id}/tokens", response_model=CreatedTokenOut,
+          status_code=201, tags=["tokens"])
+def create_account_token(account_id: UUID, body: CreateAccountToken, session: DB,
+                         scope: Auth):
+    token, secret = services.create_account_token(session, scope, account_id, body.label,
+                                                  body.expires_in_days)
+    return {**TokenOut.model_validate(token).model_dump(), "token": secret}
+
+
+@app.get("/v1/accounts/{account_id}/tokens", response_model=list[TokenOut], tags=["tokens"])
+def list_account_tokens(account_id: UUID, session: DB, scope: Auth, limit: Limit = 25,
+                        page: Page = 1):
+    return services.account_tokens(session, scope, account_id, limit, page)
+
+
+@app.post("/v1/tokens/{token_id}/revoke", response_model=TokenOut, tags=["tokens"])
+def revoke_account_token(token_id: UUID, session: DB, scope: Auth):
+    return services.revoke_account_token(session, scope, token_id)

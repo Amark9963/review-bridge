@@ -12,9 +12,10 @@ Kafka, Kubernetes, or microservices in V1.
 - Partner IDs never come from creation request bodies. Path IDs are authorized in services.
 - Foreign keys enforce account/location tenant consistency. No implicit cascading deletion.
 - Unknown and inaccessible resources both return 404; missing/invalid tokens return 401.
-- Partner bootstrap and token issuance/revocation are operator CLI actions.
+- Partner bootstrap and partner-token issuance/revocation are operator CLI actions.
+  Partners issue account tokens through the API (slice 6b).
 - Synchronous SQLAlchemy keeps transaction ownership understandable at this scale.
-- This first slice supports partner tokens only. Account scope is a later migration.
+- Slice 1 supported partner tokens only; account tokens arrived in slice 6b.
 - Development and test databases are separate; integration tests exercise PostgreSQL.
 
 ## Connections
@@ -191,6 +192,41 @@ changes beyond a new `trigger` field on jobs).
   this slice that included `SYNC_COOLDOWN_SECONDS`, which the README described as
   configurable but which had no effect in Compose.
 
+## Account tokens and rate limits
+
+Approved by the user on 2026-10-16 (partners issue account tokens through the API; an
+account token can do everything within its account) and implemented in slice 6b. Rate
+limit defaults were proposed to the user.
+
+- A token has an optional `account_id`. Without it, it is a partner token, as before. A
+  composite foreign key `(partner_id, account_id)` keeps an account token inside its
+  partner.
+- Partners issue (`POST /v1/accounts/{id}/tokens`), list and revoke their accounts' tokens.
+  Secrets are shown once and stored hashed, like partner tokens; expiry is 1-365 days
+  (default 90). Partner tokens remain operator-only (CLI). `GET /v1/token` tells any token
+  what it is.
+- An account token can do everything within its account. Every lookup is filtered to its
+  account's locations in the service layer, so other accounts' IDs are 404, like any
+  unknown ID. Partner-level endpoints (partner details, creating or listing accounts, the
+  partner-wide feed, token management) return 403 `insufficient_scope`, following SAU:
+  the token is valid, its type is not allowed there.
+- One accepted leak inside a partner: connecting a business another account of the same
+  partner already uses returns 409 `business_already_connected`, revealing that it is in
+  use. Partners own all their accounts, so this stays within the tenant.
+- Rate limits count per token, per endpoint group, per one-minute window: review feeds 300,
+  token management 30, everything else 120 (configurable). Counting per partner would let
+  one customer's token use up the partner's allowance; to stop partners multiplying their
+  allowance with extra tokens, an account has at most 10 active tokens.
+- Counters are PostgreSQL rows upserted once per authenticated request, because V1 has no
+  Redis. Fixed windows allow up to twice the limit across a window boundary. The worker
+  deletes windows older than an hour.
+- Only authenticated requests count; unknown tokens have nothing to count against, and
+  guessing 256-bit tokens is infeasible. Limiting by IP belongs at a proxy.
+- Headers follow SAU: `X-RateLimit-Limit` and `X-RateLimit-Remaining` on every limited
+  response; `Retry-After` and `X-RateLimit-Reset` with 429 `rate_limited`.
+- Downgrading migration 0007 deletes account tokens rather than dropping their
+  `account_id`, which would silently widen them into partner tokens.
+
 ## Next slices
 
 1. ~~Location review-site connections and capabilities (Yelp only).~~ Done; see Connections.
@@ -202,8 +238,8 @@ changes beyond a new `trigger` field on jobs).
    see Feed filters and incremental sync.
 5. Live-ready Yelp adapter, never switched on (see Live Yelp decision). Done after slice 6.
 6. Scheduling, inbound rate limits, account tokens and operational logging, in two parts:
-   ~~6a scheduling and structured logging~~ (done; see Scheduling and logging); 6b account
-   tokens and inbound rate limits.
+   ~~6a scheduling and structured logging~~ (done; see Scheduling and logging); ~~6b
+   account tokens and inbound rate limits~~ (done; see Account tokens and rate limits).
 7. Optional signed outbound webhooks with stable event IDs and durable deduplication.
 
 ### Live Yelp decision
