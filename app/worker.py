@@ -15,7 +15,7 @@ from datetime import timedelta
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import jobs, logs
+from app import jobs, logs, ratelimit
 from app.config import settings
 from app.db import engine
 from app.models import WorkerHeartbeat
@@ -60,6 +60,7 @@ def run_forever():
                     last_beat = now
                 if last_schedule is None or now - last_schedule >= SCHEDULE_EVERY:
                     jobs.schedule_due(session, now, interval)
+                    ratelimit.prune(session, now)
                     last_schedule = now
                 job = jobs.claim(session, worker_id, now)
                 if job is None:

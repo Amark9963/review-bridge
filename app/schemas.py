@@ -199,3 +199,29 @@ class ReviewSiteOut(BaseModel):
     deletion_detection: bool
     reply_posting: bool
     content_max_age_hours: int
+
+
+class CreateAccountToken(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    label: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1,
+                                            max_length=200)]
+    expires_in_days: Annotated[int, Field(ge=1, le=365)] = 90
+
+
+class TokenOut(BaseModel):
+    """Never includes the secret or its hash; `prefix` identifies a token in conversation."""
+
+    model_config = ConfigDict(from_attributes=True)
+    id: UUID
+    created_at: datetime
+    partner_id: UUID
+    account_id: UUID | None
+    label: str
+    prefix: str
+    expires_at: datetime
+    revoked_at: datetime | None
+
+
+class CreatedTokenOut(TokenOut):
+    # Shown once. Store it securely; it cannot be retrieved again.
+    token: str

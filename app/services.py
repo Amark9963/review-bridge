@@ -9,11 +9,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import jobs
-from app.auth import Scope
+from app.auth import Scope, issue_token
 from app.config import settings
 from app.errors import ServiceError, not_found
 from app.models import (
     Account,
+    ApiToken,
     Location,
     Partner,
     Review,
@@ -33,7 +34,23 @@ CONNECTION_CONFLICTS = {
 }
 
 
+def require_partner(scope: Scope):
+    """Partner-level endpoints refuse account tokens with 403: the caller is known, but the
+    token type cannot use this endpoint. IDs outside an account token's account are 404."""
+    if scope.account_id is not None:
+        raise ServiceError(403, "insufficient_scope", "This endpoint needs a partner token")
+
+
+def in_scope_locations(scope: Scope):
+    """IDs of the locations a token may act on."""
+    query = select(Location.id).where(Location.partner_id == scope.partner_id)
+    if scope.account_id is not None:
+        query = query.where(Location.account_id == scope.account_id)
+    return query
+
+
 def partner(session: Session, scope: Scope):
+    require_partner(scope)
     result = session.get(Partner, scope.partner_id)
     if result is None:
         raise not_found()
@@ -41,6 +58,8 @@ def partner(session: Session, scope: Scope):
 
 
 def account(session: Session, scope: Scope, account_id: UUID):
+    if scope.account_id is not None and account_id != scope.account_id:
+        raise not_found()
     result = session.scalar(select(Account).where(
         Account.id == account_id, Account.partner_id == scope.partner_id,
     ))
@@ -51,7 +70,7 @@ def account(session: Session, scope: Scope, account_id: UUID):
 
 def location(session: Session, scope: Scope, location_id: UUID):
     result = session.scalar(select(Location).where(
-        Location.id == location_id, Location.partner_id == scope.partner_id,
+        Location.id == location_id, Location.id.in_(in_scope_locations(scope)),
     ))
     if result is None:
         raise not_found()
@@ -59,6 +78,7 @@ def location(session: Session, scope: Scope, location_id: UUID):
 
 
 def create_account(session: Session, scope: Scope, partner_id: UUID, name: str):
+    require_partner(scope)
     if partner_id != scope.partner_id:
         raise not_found()
     result = Account(partner_id=scope.partner_id, name=name)
@@ -78,6 +98,7 @@ def create_location(session: Session, scope: Scope, account_id: UUID, name: str)
 
 
 def accounts(session: Session, scope: Scope, limit: int, page: int):
+    require_partner(scope)
     return session.scalars(select(Account).where(Account.partner_id == scope.partner_id)
         .order_by(Account.created_at, Account.id).limit(limit).offset((page - 1) * limit)).all()
 
@@ -93,6 +114,7 @@ def connection(session: Session, scope: Scope, connection_id: UUID):
     result = session.scalar(select(ReviewSiteConnection).where(
         ReviewSiteConnection.id == connection_id,
         ReviewSiteConnection.partner_id == scope.partner_id,
+        ReviewSiteConnection.location_id.in_(in_scope_locations(scope)),
     ))
     if result is None:
         raise not_found()
@@ -235,8 +257,11 @@ def request_sync(session: Session, scope: Scope, connection_id: UUID):
 
 
 def sync_job(session: Session, scope: Scope, job_id: UUID):
+    connections = select(ReviewSiteConnection.id).where(
+        ReviewSiteConnection.location_id.in_(in_scope_locations(scope)))
     result = session.scalar(select(SyncJob).where(SyncJob.id == job_id,
-                                                  SyncJob.partner_id == scope.partner_id))
+                                                  SyncJob.partner_id == scope.partner_id,
+                                                  SyncJob.connection_id.in_(connections)))
     if result is None:
         raise not_found()
     attempts = session.scalars(select(SyncAttempt).where(SyncAttempt.job_id == job_id)
@@ -288,7 +313,9 @@ def review_feed(session: Session, scope: Scope, q: ReviewFeedQuery,
         .where(Review.partner_id == scope.partner_id))
     if not q.include_removed:
         query = query.where(ReviewSiteConnection.disabled_at.is_(None))
-    if account_id is not None:
+    if account_id is None:
+        require_partner(scope)
+    else:
         account(session, scope, account_id)
         query = query.where(Location.account_id == account_id)
     if q.location_id is not None:
@@ -330,3 +357,59 @@ def review_feed(session: Session, scope: Scope, q: ReviewFeedQuery,
             for review, provider, location_id, row_account_id, disabled_at, disabled_reason
             in rows]
     return {"data": data, "meta": meta}
+
+
+MAX_ACTIVE_ACCOUNT_TOKENS = 10
+
+
+def current_token(session: Session, scope: Scope):
+    return session.get(ApiToken, scope.token_id)
+
+
+def create_account_token(session: Session, scope: Scope, account_id: UUID, label: str,
+                         days: int):
+    """Returns the stored token and its secret, which is shown once and never stored.
+    Rate limits count per token, so the active tokens per account are capped; otherwise
+    issuing more tokens would multiply an account's allowance."""
+    require_partner(scope)
+    account(session, scope, account_id)
+    # Serializes concurrent issuance for this account, so the cap cannot be overrun.
+    session.scalar(select(Account).where(Account.id == account_id).with_for_update())
+    now = datetime.now(UTC)
+    active = session.scalar(select(func.count()).select_from(ApiToken).where(
+        ApiToken.account_id == account_id, ApiToken.revoked_at.is_(None),
+        ApiToken.expires_at > now))
+    if active >= MAX_ACTIVE_ACCOUNT_TOKENS:
+        session.rollback()
+        raise ServiceError(409, "token_limit",
+                           f"An account can have at most {MAX_ACTIVE_ACCOUNT_TOKENS} active "
+                           "tokens; revoke one first")
+    token, secret = issue_token(session, scope.partner_id, label, days, account_id)
+    session.commit()
+    session.refresh(token)
+    return token, secret
+
+
+def account_tokens(session: Session, scope: Scope, account_id: UUID, limit: int, page: int):
+    """Every token ever issued for the account, newest first, including revoked ones."""
+    require_partner(scope)
+    account(session, scope, account_id)
+    return session.scalars(select(ApiToken).where(ApiToken.account_id == account_id)
+        .order_by(ApiToken.created_at.desc(), ApiToken.id)
+        .limit(limit).offset((page - 1) * limit)).all()
+
+
+def revoke_account_token(session: Session, scope: Scope, token_id: UUID):
+    """Partners revoke their accounts' tokens; partner tokens are revoked by the operator.
+    Repeating the call returns the token unchanged."""
+    require_partner(scope)
+    token = session.scalar(select(ApiToken).where(ApiToken.id == token_id,
+                                                  ApiToken.partner_id == scope.partner_id,
+                                                  ApiToken.account_id.is_not(None)))
+    if token is None:
+        raise not_found()
+    if token.revoked_at is None:
+        token.revoked_at = datetime.now(UTC)
+        session.commit()
+        session.refresh(token)
+    return token

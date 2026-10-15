@@ -15,7 +15,10 @@ Sync jobs run in a separate worker with retries, lease recovery and attempt hist
 worker also syncs every active connection on a schedule (every 12 hours by default). The
 API and worker write structured JSON logs.
 
-Not implemented yet: account tokens, rate limiting, or webhooks. ReviewBridge never calls
+Partners can issue account tokens limited to one account, and every authenticated request
+is rate limited per token.
+
+Not implemented yet: webhooks, and the live-ready Yelp adapter. ReviewBridge never calls
 the real Yelp API; see the [Live Yelp decision](docs/architecture.md#live-yelp-decision).
 Build these one vertical slice at a time.
 
@@ -87,6 +90,22 @@ docker compose exec api python -m app.cli revoke-token --token-id <UUID>
 
 For rotation, issue a replacement, move the client to it, then revoke the old token.
 There is no unauthenticated token-issuance or partner-creation HTTP endpoint.
+
+Partners issue **account tokens** for their own accounts through the API, for example to
+give a customer access to only their account:
+
+1. `POST /v1/accounts/{account_id}/tokens` with `{"label":"customer portal"}` (optionally
+   `"expires_in_days"`, 1-365, default 90). The token is in the response once.
+2. With it, `GET /v1/token` shows its `account_id`. It can do everything within that
+   account (locations, connections, syncs, the account review feed). Other accounts' IDs
+   return `404`; partner-level endpoints return `403 insufficient_scope`.
+3. `GET /v1/accounts/{account_id}/tokens` lists them; `POST /v1/tokens/{token_id}/revoke`
+   revokes one. An account can have at most 10 active tokens.
+
+Every authenticated request is **rate limited per token** in three groups: review feeds
+300/min, token issuance 30/min, everything else 120/min. Responses carry
+`X-RateLimit-Limit` and `X-RateLimit-Remaining`; over the limit you get
+`429 rate_limited` with `Retry-After`.
 
 ## Verify
 

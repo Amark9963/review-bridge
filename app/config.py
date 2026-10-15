@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     # for 24 hours, so 12 leaves room for one missed run.
     sync_interval_hours: float = 12
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    # Requests per minute, per token, for each endpoint group.
+    rate_limit_feed_per_minute: int = 300
+    rate_limit_tokens_per_minute: int = 30
+    rate_limit_default_per_minute: int = 120
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
