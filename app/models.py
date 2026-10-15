@@ -110,6 +110,7 @@ class Review(Identity, Base):
                          name="uq_reviews_connection_external"),
         CheckConstraint("rating BETWEEN 1 AND 5", name="ck_reviews_rating"),
         Index("ix_reviews_partner_reviewed", "partner_id", "reviewed_at"),
+        Index("ix_reviews_partner_updated", "partner_id", "updated_at", "id"),
     )
     partner_id: Mapped[UUID]
     connection_id: Mapped[UUID]
@@ -123,6 +124,9 @@ class Review(Identity, Base):
     # Advances only when content changes; unchanged observations update last_seen_at.
     content_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # What feed clients sync on: advances when content changes or the review is removed
+    # (its connection disabled), never for unchanged observations.
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 UNFINISHED = text("status IN ('queued', 'running')")

@@ -78,6 +78,8 @@ Approved by the user on 2026-10-11 and implemented in the third slice.
 - Feeds follow SAU's scoping: `GET /v1/partner/reviews` (whole partner) and
   `GET /v1/accounts/{id}/reviews` (one account, which account tokens will use later). Both
   show only active connections, newest first, with `meta` (page, limit, total, last_page).
+  Filters, removals and cursor sync were added in the fifth slice (see Feed filters and
+  incremental sync).
 
 ## Sync jobs and worker
 
@@ -115,6 +117,48 @@ scheduled collection, no on-demand endpoint); SAU's internals are not public.
   before live Yelp (slice 5), keep the provider timeout well under the 60-second lease or
   renew it, otherwise a slow call can be recovered and fetched twice (writes stay safe).
 
+## Feed filters and incremental sync
+
+Approved by the user on 2026-10-15 (cursor paging for sync; removals announced now) and
+implemented in the fifth slice. Filters and `updated_since` follow SAU's feed; the cursor
+differs from SAU, which documents page numbers only.
+
+- Both feeds accept `location_id`, `provider`, repeated `rating`, `reviewed_from`/
+  `reviewed_to` (review date), `created_since` (when collected) and `updated_since`.
+  Timestamps need an explicit offset. Unknown parameters are rejected (422), so a typo is
+  never silently ignored. A location outside the partner, or outside the account being
+  read, is 404 like any other unknown ID.
+- Two orders. `sort=reviewed_at` (default, newest first) is for browsing, with page numbers
+  and `meta.total`. `sort=updated_at` (oldest change first) is for sync, paged by
+  `meta.next_cursor`, which encodes the last row's `(updated_at, id)`.
+- Why a cursor: with page numbers, a review that changes after a client read page 1 moves to
+  the end, every row behind it shifts back one place, and one unchanged review is skipped
+  for good. With a cursor, "the rows after this one" is unaffected; the changed review is
+  simply served again at the end. `page` with `sort=updated_at` is rejected.
+- Page validation: `limit` 1-100; browsing serves at most 10,000 rows deep (`page` 400 at
+  the default limit); `reviewed_from` must not be after `reviewed_to`; a malformed cursor is
+  422 `invalid_cursor`.
+- `reviews.updated_at` advances when content changes or the review is removed, never for
+  unchanged observations. It is a stored, indexed column `(partner_id, updated_at, id)`.
+- Removals: `include_removed=true` also returns reviews of disabled connections, with
+  `removed_at` and `removed_reason`. Disabling advances their `updated_at`, so removals
+  reach `updated_since` syncs and partners can delete reviews they copied.
+- Writers read the clock only after taking the connection's row lock (the worker before
+  writing reviews, disabling before marking them removed), and disabling uses
+  `GREATEST(updated_at, now)`, so a review's `updated_at` never moves backwards.
+
+Freshness contract (eventual consistency): a change is stamped just before its transaction
+commits, and timestamps come from the hosts' clocks. A change can therefore become visible
+slightly after a client read past its timestamp. Clients sync like this:
+
+1. Request `sort=updated_at&include_removed=true&updated_since=<T>`, where `T` is when the
+   previous sync started minus 5 minutes (omit it the first time).
+2. Follow `meta.next_cursor` until it is null. Note when this sync started.
+3. Upsert each review by `id`; delete any with `removed_at` set.
+
+The overlap re-serves some reviews, which upserting makes harmless. Five minutes covers
+commit delay and modest clock skew between hosts; it is not a hard guarantee.
+
 ## Next slices
 
 1. ~~Location review-site connections and capabilities (Yelp only).~~ Done; see Connections.
@@ -122,7 +166,8 @@ scheduled collection, no on-demand endpoint); SAU's internals are not public.
    feed.~~ Done; see Reviews and feed.
 3. ~~Durable PostgreSQL jobs, worker leases/recovery, attempt history, retries and
    health.~~ Done; see Sync jobs and worker.
-4. Feed filters, updated_since, page validation, eventual-consistency contract.
+4. ~~Feed filters, updated_since, page validation, eventual-consistency contract.~~ Done;
+   see Feed filters and incremental sync.
 5. Authorized live Yelp evaluation with content expiry and no unsupported completeness claims.
 6. Scheduling, inbound rate limits, account tokens and operational logging.
 7. Optional signed outbound webhooks with stable event IDs and durable deduplication.

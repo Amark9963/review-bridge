@@ -2,7 +2,14 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, StringConstraints
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_validator,
+)
 
 
 class CreateNamed(BaseModel):
@@ -101,6 +108,48 @@ class ReviewOut(BaseModel):
     reviewed_at: datetime
     created_at: datetime
     content_updated_at: datetime
+    updated_at: datetime
+    # Set only with include_removed, for reviews whose connection was disabled.
+    removed_at: datetime | None
+    removed_reason: DisableReason | None
+
+
+# Deep offsets get slow and are never needed: filter, or sync with sort=updated_at.
+MAX_OFFSET = 10_000
+
+
+class ReviewFeedQuery(BaseModel):
+    """Two orders. `reviewed_at` (default, newest first) is for browsing, with page/limit.
+    `updated_at` (oldest change first) is for incremental sync, with cursors: rows that
+    change mid-sync move to the end instead of shifting unread pages."""
+
+    model_config = ConfigDict(extra="forbid")
+    limit: Annotated[int, Field(ge=1, le=100)] = 25
+    page: Annotated[int, Field(ge=1)] | None = None
+    sort: Literal["reviewed_at", "updated_at"] = "reviewed_at"
+    cursor: Annotated[str, StringConstraints(max_length=200)] | None = None
+    location_id: UUID | None = None
+    provider: Provider | None = None
+    rating: list[Annotated[int, Field(ge=1, le=5)]] | None = None
+    # Timestamps need an explicit offset (for example `Z`), so they are never ambiguous.
+    reviewed_from: AwareDatetime | None = None
+    reviewed_to: AwareDatetime | None = None
+    created_since: AwareDatetime | None = None
+    updated_since: AwareDatetime | None = None
+    include_removed: bool = False
+
+    @model_validator(mode="after")
+    def consistent(self):
+        if self.sort == "updated_at" and self.page is not None:
+            raise ValueError("page is not used with sort=updated_at; follow meta.next_cursor")
+        if self.cursor is not None and self.sort != "updated_at":
+            raise ValueError("cursor requires sort=updated_at")
+        if self.reviewed_from and self.reviewed_to and self.reviewed_from > self.reviewed_to:
+            raise ValueError("reviewed_from must not be after reviewed_to")
+        if ((self.page or 1) - 1) * self.limit >= MAX_OFFSET:
+            raise ValueError(f"pages beyond {MAX_OFFSET} rows are not served; "
+                             "narrow the filters or use sort=updated_at")
+        return self
 
 
 class PageMeta(BaseModel):
@@ -110,9 +159,15 @@ class PageMeta(BaseModel):
     last_page: int
 
 
+class CursorMeta(BaseModel):
+    limit: int
+    # Null once there are no more rows; start the next sync from updated_since instead.
+    next_cursor: str | None
+
+
 class ReviewPageOut(BaseModel):
     data: list[ReviewOut]
-    meta: PageMeta
+    meta: PageMeta | CursorMeta
 
 
 class BusinessOut(BaseModel):

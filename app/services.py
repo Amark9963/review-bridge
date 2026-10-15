@@ -1,8 +1,10 @@
+import base64
+import json
 import math
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, tuple_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -19,7 +21,7 @@ from app.models import (
     SyncAttempt,
     SyncJob,
 )
-from app.schemas import SyncJobOut
+from app.schemas import ReviewFeedQuery, SyncJobOut
 from app.yelp import BusinessNotFound, ProviderUnavailable, YelpClient
 
 CONNECTION_CONFLICTS = {
@@ -161,12 +163,23 @@ def connections(session: Session, scope: Scope, location_id: UUID, include_disab
 def disable_connection(session: Session, scope: Scope, connection_id: UUID, reason: str):
     """Repeating the call returns the connection unchanged, keeping the original reason."""
     result = connection(session, scope, connection_id)
+    # Lock first, then read the clock: a worker writing reviews holds this lock, so the
+    # removal's updated_at is always later than the worker's and never moves backwards.
+    result = session.scalar(select(ReviewSiteConnection)
+        .where(ReviewSiteConnection.id == connection_id)
+        .with_for_update().execution_options(populate_existing=True))
     if result.disabled_at is None:
         now = datetime.now(UTC)
         result.disabled_at = now
         result.disabled_reason = reason
         session.flush()
         jobs.cancel_queued(session, connection_id, now)
+        # Its reviews are now removed; advancing updated_at shows the removal to clients
+        # syncing with updated_since. The worker re-checks this row before writing, so no
+        # later sync can write to these reviews. GREATEST keeps updated_at from moving
+        # backwards even if another host's clock ran ahead.
+        session.execute(update(Review).where(Review.connection_id == connection_id)
+                        .values(updated_at=func.greatest(Review.updated_at, now)))
         session.commit()
         session.refresh(result)
     return result
@@ -240,26 +253,80 @@ def sync_jobs(session: Session, scope: Scope, connection_id: UUID, limit: int, p
 
 
 REVIEW_FIELDS = ["id", "connection_id", "external_review_id", "rating", "text", "author_name",
-                 "review_url", "reviewed_at", "created_at", "content_updated_at"]
+                 "review_url", "reviewed_at", "created_at", "content_updated_at", "updated_at"]
 
 
-def review_feed(session: Session, scope: Scope, limit: int, page: int,
+def encode_cursor(updated_at: datetime, review_id: UUID) -> str:
+    """Opaque to clients: the position after the last row served, as (updated_at, id)."""
+    raw = json.dumps([updated_at.isoformat(), str(review_id)]).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def decode_cursor(cursor: str) -> tuple[datetime, UUID]:
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        updated_at, review_id = json.loads(raw)
+        position = datetime.fromisoformat(updated_at), UUID(review_id)
+    except (ValueError, TypeError, AttributeError):
+        position = None
+    if position is None or position[0].tzinfo is None:
+        raise ServiceError(422, "invalid_cursor",
+                           "Cursor is malformed; restart the sync from updated_since")
+    return position
+
+
+def review_feed(session: Session, scope: Scope, q: ReviewFeedQuery,
                 account_id: UUID | None = None):
-    """Reviews from active connections only, newest first."""
+    """Browsing (`sort=reviewed_at`) pages by number, newest first. Syncing
+    (`sort=updated_at`) pages by cursor, oldest change first, so rows that change during a
+    sync move to the end instead of shifting rows the client has not read yet."""
     query = (select(Review, ReviewSiteConnection.provider, ReviewSiteConnection.location_id,
-                    Location.account_id)
+                    Location.account_id, ReviewSiteConnection.disabled_at,
+                    ReviewSiteConnection.disabled_reason)
         .join(ReviewSiteConnection, ReviewSiteConnection.id == Review.connection_id)
         .join(Location, Location.id == ReviewSiteConnection.location_id)
-        .where(Review.partner_id == scope.partner_id,
-               ReviewSiteConnection.disabled_at.is_(None)))
+        .where(Review.partner_id == scope.partner_id))
+    if not q.include_removed:
+        query = query.where(ReviewSiteConnection.disabled_at.is_(None))
     if account_id is not None:
         account(session, scope, account_id)
         query = query.where(Location.account_id == account_id)
-    total = session.scalar(select(func.count()).select_from(query.subquery()))
-    rows = session.execute(query.order_by(Review.reviewed_at.desc(), Review.id)
-        .limit(limit).offset((page - 1) * limit)).all()
+    if q.location_id is not None:
+        # Outside the partner, or outside the account being read: unknown, like any ID.
+        found = location(session, scope, q.location_id)
+        if account_id is not None and found.account_id != account_id:
+            raise not_found()
+        query = query.where(ReviewSiteConnection.location_id == q.location_id)
+    filters = [
+        (q.provider, lambda: ReviewSiteConnection.provider == q.provider),
+        (q.rating, lambda: Review.rating.in_(q.rating)),
+        (q.reviewed_from, lambda: Review.reviewed_at >= q.reviewed_from),
+        (q.reviewed_to, lambda: Review.reviewed_at <= q.reviewed_to),
+        (q.created_since, lambda: Review.created_at >= q.created_since),
+        (q.updated_since, lambda: Review.updated_at >= q.updated_since),
+    ]
+    query = query.where(*[condition() for value, condition in filters if value is not None])
+
+    if q.sort == "updated_at":
+        if q.cursor is not None:
+            query = query.where(tuple_(Review.updated_at, Review.id)
+                                > tuple_(*decode_cursor(q.cursor)))
+        rows = session.execute(query.order_by(Review.updated_at, Review.id)
+                               .limit(q.limit + 1)).all()
+        more, rows = len(rows) > q.limit, rows[:q.limit]
+        last = rows[-1][0] if more else None
+        meta = {"limit": q.limit,
+                "next_cursor": encode_cursor(last.updated_at, last.id) if last else None}
+    else:
+        page = q.page or 1
+        total = session.scalar(select(func.count()).select_from(query.subquery()))
+        rows = session.execute(query.order_by(Review.reviewed_at.desc(), Review.id)
+            .limit(q.limit).offset((page - 1) * q.limit)).all()
+        meta = {"page": page, "limit": q.limit, "total": total,
+                "last_page": max(1, math.ceil(total / q.limit))}
     data = [{**{column: getattr(review, column) for column in REVIEW_FIELDS},
-             "provider": provider, "location_id": location_id, "account_id": row_account_id}
-            for review, provider, location_id, row_account_id in rows]
-    return {"data": data, "meta": {"page": page, "limit": limit, "total": total,
-                                   "last_page": max(1, math.ceil(total / limit))}}
+             "provider": provider, "location_id": location_id, "account_id": row_account_id,
+             "removed_at": disabled_at, "removed_reason": disabled_reason}
+            for review, provider, location_id, row_account_id, disabled_at, disabled_reason
+            in rows]
+    return {"data": data, "meta": meta}
